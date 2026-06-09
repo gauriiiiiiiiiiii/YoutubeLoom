@@ -44,7 +44,7 @@ export default function WebcamPreview({ position, size, onPositionChange, onSize
             );
           })}
           {/* Screen icon in center */}
-          <div className="absolute inset-0 flex items-center justify-center">
+          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <svg className="w-6 h-6 text-white/10" fill="currentColor" viewBox="0 0 24 24">
               <path d="M4 6a2 2 0 012-2h12a2 2 0 012 2v7a2 2 0 01-2 2H6a2 2 0 01-2-2V6zm2 9h12l1 3H3l1-3z" />
             </svg>

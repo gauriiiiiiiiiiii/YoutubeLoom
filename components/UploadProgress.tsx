@@ -1,5 +1,6 @@
 'use client';
 
+import { useState } from 'react';
 import { type UploadProgress as UploadProgressType } from '@/lib/youtube-upload';
 
 interface UploadProgressProps {
@@ -8,6 +9,15 @@ interface UploadProgressProps {
 }
 
 export default function UploadProgress({ progress, youtubeUrl }: UploadProgressProps) {
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = () => {
+    if (!youtubeUrl) return;
+    navigator.clipboard.writeText(youtubeUrl);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return '0 Bytes';
     const k = 1024;
@@ -88,13 +98,10 @@ export default function UploadProgress({ progress, youtubeUrl }: UploadProgressP
             </a>
 
             <button
-              onClick={() => {
-                navigator.clipboard.writeText(youtubeUrl);
-                alert('Link copied to clipboard!');
-              }}
+              onClick={handleCopy}
               className="px-6 py-3 bg-gray-600 hover:bg-gray-700 text-white rounded-lg font-semibold transition-colors"
             >
-              Copy Link
+              {copied ? 'Copied!' : 'Copy Link'}
             </button>
           </div>
         </div>

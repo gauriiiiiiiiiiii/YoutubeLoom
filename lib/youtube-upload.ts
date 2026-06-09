@@ -28,6 +28,7 @@ export class YouTubeUploader {
   private uploadUrl: string | null = null;
   private chunkSize: number = 5 * 1024 * 1024; // 5MB chunks
   private onProgress?: (progress: UploadProgress) => void;
+  private uploadedVideoId: string | null = null;
 
   constructor(accessToken: string, onProgress?: (progress: UploadProgress) => void) {
     this.accessToken = accessToken;
@@ -45,8 +46,8 @@ export class YouTubeUploader {
       // Step 2: Upload video in chunks
       await this.uploadChunks(videoBlob);
 
-      // Step 3: Get video ID from final response
-      const videoId = await this.getVideoId();
+      // Step 3: Get video ID captured from final chunk response
+      const videoId = this.getVideoId();
 
       this.reportProgress({
         bytesUploaded: videoBlob.size,
@@ -164,9 +165,12 @@ export class YouTubeUploader {
           body: chunk,
         });
 
-        if (response.ok || response.status === 308) {
-          // 200/201: Upload complete
-          // 308: Resume incomplete (continue uploading)
+        if (response.status === 200 || response.status === 201) {
+          const data = await response.json();
+          this.uploadedVideoId = data.id;
+          return;
+        }
+        if (response.status === 308) {
           return;
         }
 
@@ -190,28 +194,13 @@ export class YouTubeUploader {
   }
 
   /**
-   * Step 3: Get video ID from YouTube
+   * Step 3: Get video ID (captured from final chunk response)
    */
-  private async getVideoId(): Promise<string> {
-    if (!this.uploadUrl) {
-      throw new Error('Upload URL not initialized');
+  private getVideoId(): string {
+    if (!this.uploadedVideoId) {
+      throw new Error('Video ID not available — upload may not have completed');
     }
-
-    // Send empty PUT to get final response with video ID
-    const response = await fetch(this.uploadUrl, {
-      method: 'PUT',
-      headers: {
-        'Content-Length': '0',
-      },
-    });
-
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Failed to get video ID: ${error}`);
-    }
-
-    const data = await response.json();
-    return data.id;
+    return this.uploadedVideoId;
   }
 
   /**

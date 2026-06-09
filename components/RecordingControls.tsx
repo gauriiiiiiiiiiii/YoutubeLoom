@@ -18,12 +18,10 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
   const [recordingTime, setRecordingTime] = useState(0);
   const [storageSize, setStorageSize] = useState(0);
   const [enableWebcam, setEnableWebcam] = useState(true);
-  const [webcamPosition, setWebcamPosition] = useState<
-    'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'
-  >('bottom-right');
+  const [webcamPosition, setWebcamPosition] = useState<'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'>('bottom-right');
   const [webcamSize, setWebcamSize] = useState(20);
 
-  // Clean up any leftover IndexedDB chunks from previous sessions
+  // Clean up leftover IndexedDB chunks from crashed sessions
   useEffect(() => {
     const cleanup = new IndexedDBStorage();
     cleanup.clearAllRecordings().catch(() => {});
@@ -33,66 +31,52 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     if (isRecording) {
-      interval = setInterval(() => setRecordingTime((prev) => prev + 1), 1000);
+      interval = setInterval(() => setRecordingTime((t) => t + 1), 1000);
     } else {
       setRecordingTime(0);
     }
     return () => { if (interval) clearInterval(interval); };
   }, [isRecording]);
 
-  // Update storage size periodically
+  // Storage size polling
   useEffect(() => {
     let interval: NodeJS.Timeout | null = null;
     if (isRecording && storage) {
       interval = setInterval(async () => {
-        const size = await storage.getTotalSize();
-        setStorageSize(size);
+        setStorageSize(await storage.getTotalSize());
       }, 2000);
     }
     return () => { if (interval) clearInterval(interval); };
   }, [isRecording, storage]);
 
-  const formatTime = (seconds: number): string => {
-    const hrs = Math.floor(seconds / 3600);
-    const mins = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    if (hrs > 0) {
-      return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
+  const formatTime = (s: number) => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h > 0) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
   };
 
-  const formatBytes = (bytes: number): string => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+  const formatBytes = (b: number) => {
+    if (b === 0) return '0 B';
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(b) / Math.log(1024));
+    return (b / Math.pow(1024, i)).toFixed(1) + ' ' + sizes[i];
   };
 
   const startRecording = async () => {
     try {
       setError(null);
-
-      if (!ScreenRecorder.isSupported()) {
-        throw new Error('Screen recording is not supported in your browser');
-      }
+      if (!ScreenRecorder.isSupported()) throw new Error('Screen recording not supported in this browser');
 
       const db = new IndexedDBStorage();
       await db.init();
       setStorage(db);
 
-      const newRecorder = new ScreenRecorder({
+      const rec = new ScreenRecorder({
         enableWebcam,
-        webcamOptions: {
-          webcamPosition,
-          webcamSize,
-          webcamBorderRadius: 12,
-          frameRate: 15,
-        },
-        onDataAvailable: async (blob) => {
-          await db.storeChunk(blob);
-        },
+        webcamOptions: { webcamPosition, webcamSize, webcamBorderRadius: 12, frameRate: 15 },
+        onDataAvailable: async (blob) => { await db.storeChunk(blob); },
         onStop: async () => {
           setIsRecording(false);
           setIsProcessing(true);
@@ -100,9 +84,7 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
           await db.clearChunks();
           db.close();
           setIsProcessing(false);
-          if (onRecordingComplete) {
-            onRecordingComplete(finalBlob);
-          }
+          onRecordingComplete?.(finalBlob);
         },
         onError: (err) => {
           setError(err.message);
@@ -111,8 +93,8 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
         },
       });
 
-      await newRecorder.start();
-      setRecorder(newRecorder);
+      await rec.start();
+      setRecorder(rec);
       setIsRecording(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to start recording');
@@ -120,115 +102,129 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
   };
 
   const stopRecording = () => {
-    if (recorder) {
-      recorder.stop();
-      setRecorder(null);
-    }
+    recorder?.stop();
+    setRecorder(null);
   };
 
-  const handleWebcamPositionChange = (position: 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right') => {
-    setWebcamPosition(position);
-    if (recorder) recorder.updateWebcamPosition(position);
-  };
-
-  const handleWebcamSizeChange = (size: number) => {
-    setWebcamSize(size);
-    if (recorder) recorder.updateWebcamSize(size);
-  };
-
-  // Processing state — combining chunks
+  // ── Processing state ──
   if (isProcessing) {
     return (
-      <div className="flex flex-col items-center gap-4">
-        <div className="flex items-center gap-3 text-gray-600 dark:text-gray-400">
-          <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
-            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-          </svg>
-          <span className="font-medium">Processing recording...</span>
+      <div className="flex flex-col items-center gap-3 py-8">
+        <div className="relative w-14 h-14">
+          <div className="absolute inset-0 rounded-full border-2 border-blue-500/20" />
+          <div className="absolute inset-0 rounded-full border-2 border-transparent border-t-blue-500 animate-spin" />
+          <div className="absolute inset-2 rounded-full bg-blue-500/10 flex items-center justify-center">
+            <svg className="w-5 h-5 text-blue-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.069A1 1 0 0121 8.87v6.26a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </div>
         </div>
-        <p className="text-xs text-gray-500 dark:text-gray-400">Combining video chunks, please wait</p>
+        <div className="text-center">
+          <p className="text-sm font-medium text-white">Processing recording…</p>
+          <p className="text-xs text-neutral-500 mt-0.5">Combining video chunks</p>
+        </div>
       </div>
     );
   }
 
-  return (
-    <div className="flex flex-col items-center gap-6">
-      {!isRecording && (
-        <>
-          {/* Webcam toggle */}
-          <div className="flex items-center gap-3">
-            <span className="text-sm font-medium text-gray-700 dark:text-gray-300">Webcam Overlay</span>
-            <button
-              onClick={() => setEnableWebcam((v) => !v)}
-              className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors ${
-                enableWebcam ? 'bg-blue-600' : 'bg-gray-300 dark:bg-gray-600'
-              }`}
-            >
-              <span
-                className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
-                  enableWebcam ? 'translate-x-6' : 'translate-x-1'
-                }`}
-              />
-            </button>
+  // ── Recording active state ──
+  if (isRecording) {
+    return (
+      <div className="flex flex-col items-center gap-6 py-4">
+        {/* Timer */}
+        <div className="flex flex-col items-center gap-1">
+          <div className="flex items-center gap-2">
+            <div className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            <span className="text-3xl font-mono font-bold tracking-wider text-white">
+              {formatTime(recordingTime)}
+            </span>
           </div>
-
-          {enableWebcam && (
-            <WebcamPreview
-              position={webcamPosition}
-              size={webcamSize}
-              onPositionChange={handleWebcamPositionChange}
-              onSizeChange={handleWebcamSizeChange}
-            />
+          {storageSize > 0 && (
+            <span className="text-xs text-neutral-500">{formatBytes(storageSize)} saved</span>
           )}
-        </>
-      )}
+        </div>
 
-      {error && (
-        <div className="bg-red-500/10 border border-red-500 text-red-500 px-4 py-3 rounded-lg max-w-md text-sm">
-          <p className="font-semibold">Error</p>
-          <p>{error}</p>
+        {/* Stop button */}
+        <button
+          onClick={stopRecording}
+          className="relative w-16 h-16 rounded-full bg-red-600 hover:bg-red-700 active:scale-95 transition-all record-pulse flex items-center justify-center"
+        >
+          <div className="w-5 h-5 bg-white rounded-sm" />
+        </button>
+
+        <p className="text-xs text-neutral-600 text-center max-w-xs">
+          Click the button or use the browser&apos;s stop sharing control to finish
+        </p>
+      </div>
+    );
+  }
+
+  // ── Idle state ──
+  return (
+    <div className="flex flex-col items-center gap-6 py-2">
+
+      {/* Webcam toggle */}
+      <div className="flex items-center justify-between w-full px-1">
+        <div>
+          <p className="text-sm font-medium text-white">Webcam overlay</p>
+          <p className="text-xs text-neutral-500">Picture-in-picture on recording</p>
+        </div>
+        <button
+          onClick={() => setEnableWebcam((v) => !v)}
+          className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors duration-200 ${
+            enableWebcam ? 'bg-blue-600' : 'bg-white/10'
+          }`}
+        >
+          <span
+            className={`inline-block h-4 w-4 rounded-full bg-white shadow transition-transform duration-200 ${
+              enableWebcam ? 'translate-x-6' : 'translate-x-1'
+            }`}
+          />
+        </button>
+      </div>
+
+      {/* Webcam settings */}
+      {enableWebcam && (
+        <div className="w-full">
+          <WebcamPreview
+            position={webcamPosition}
+            size={webcamSize}
+            onPositionChange={(p) => { setWebcamPosition(p); recorder?.updateWebcamPosition(p); }}
+            onSizeChange={(s) => { setWebcamSize(s); recorder?.updateWebcamSize(s); }}
+          />
         </div>
       )}
 
-      {isRecording ? (
-        <>
-          <div className="flex flex-col items-center gap-2">
-            <div className="flex items-center gap-3">
-              <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
-              <span className="text-2xl font-mono font-bold">{formatTime(recordingTime)}</span>
-            </div>
-            {storageSize > 0 && (
-              <p className="text-sm text-gray-500 dark:text-gray-400">{formatBytes(storageSize)} stored</p>
-            )}
-          </div>
+      {/* Divider */}
+      <div className="w-full h-px bg-white/[0.06]" />
 
-          <button
-            onClick={stopRecording}
-            className="px-8 py-4 bg-red-600 hover:bg-red-700 text-white rounded-lg font-semibold text-lg transition-colors"
-          >
-            Stop Recording
-          </button>
-
-          <p className="text-xs text-gray-500 dark:text-gray-400 max-w-md text-center">
-            Recording in progress. Click "Stop Recording" or use the browser's stop sharing button.
-          </p>
-        </>
-      ) : (
-        <>
-          <button
-            onClick={startRecording}
-            className="px-8 py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-semibold text-lg transition-colors"
-          >
-            Start Recording
-          </button>
-
-          <p className="text-xs text-gray-500 dark:text-gray-400 max-w-md text-center">
-            Click to start recording your screen and microphone
-            {enableWebcam ? ' with webcam overlay' : ''}.
-          </p>
-        </>
+      {/* Error */}
+      {error && (
+        <div className="w-full px-4 py-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-sm">
+          <p className="font-medium">Error</p>
+          <p className="text-xs mt-0.5 text-red-400/70">{error}</p>
+        </div>
       )}
+
+      {/* Record button */}
+      <button
+        onClick={startRecording}
+        className="group relative w-20 h-20 rounded-full bg-blue-600 hover:bg-blue-500 active:scale-95 transition-all duration-150 flex items-center justify-center shadow-lg shadow-blue-600/20"
+      >
+        {/* Outer ring */}
+        <span className="absolute inset-0 rounded-full border-2 border-blue-400/30 group-hover:border-blue-400/50 transition-colors" />
+        {/* Icon */}
+        <svg className="w-7 h-7 text-white" fill="currentColor" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="6" />
+        </svg>
+      </button>
+
+      <div className="text-center">
+        <p className="text-sm font-medium text-white">Start Recording</p>
+        <p className="text-xs text-neutral-500 mt-0.5">
+          Screen · Microphone{enableWebcam ? ' · Webcam' : ''}
+        </p>
+      </div>
     </div>
   );
 }

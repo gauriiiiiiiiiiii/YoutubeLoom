@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react';
 import { ScreenRecorder } from '@/lib/recorder';
 import { IndexedDBStorage } from '@/lib/indexdb';
 import WebcamPreview from './WebcamPreview';
+import { useToast } from './Toaster';
 
 interface RecordingControlsProps {
   onRecordingComplete?: (videoBlob: Blob) => void;
@@ -18,6 +19,7 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
   const [recordingTime, setRecordingTime] = useState(0);
   const [storageSize, setStorageSize] = useState(0);
   const [enableWebcam, setEnableWebcam] = useState(true);
+  const { toast } = useToast();
   const [webcamPosition, setWebcamPosition] = useState<'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'>('bottom-right');
   const [webcamSize, setWebcamSize] = useState(20);
 
@@ -88,6 +90,7 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
         },
         onError: (err) => {
           setError(err.message);
+          toast(err.message, 'error');
           setIsRecording(false);
           setIsProcessing(false);
         },
@@ -97,7 +100,9 @@ export default function RecordingControls({ onRecordingComplete }: RecordingCont
       setRecorder(rec);
       setIsRecording(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start recording');
+      const msg = err instanceof Error ? err.message : 'Failed to start recording';
+      setError(msg);
+      toast(msg, 'error');
     }
   };
 

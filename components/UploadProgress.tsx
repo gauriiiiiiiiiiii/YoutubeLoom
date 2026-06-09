@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { type UploadProgress as UploadProgressType } from '@/lib/youtube-upload';
+import { useToast } from './Toaster';
 
 interface UploadProgressProps {
   progress: UploadProgressType;
@@ -10,11 +11,13 @@ interface UploadProgressProps {
 
 export default function UploadProgress({ progress, youtubeUrl }: UploadProgressProps) {
   const [copied, setCopied] = useState(false);
+  const { toast } = useToast();
 
   const handleCopy = () => {
     if (!youtubeUrl) return;
     navigator.clipboard.writeText(youtubeUrl);
     setCopied(true);
+    toast('Link copied to clipboard', 'info');
     setTimeout(() => setCopied(false), 2000);
   };
 

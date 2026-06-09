@@ -16,6 +16,7 @@ import {
   getYouTubeUrl,
   type UploadProgress as UploadProgressType,
 } from '@/lib/youtube-upload';
+import { useToast } from '@/components/Toaster';
 
 export default function Home() {
   return (
@@ -41,6 +42,7 @@ function HomeContent() {
   const [videoDescription, setVideoDescription] = useState('Recorded with YouTube Loom');
   const [privacyStatus, setPrivacyStatus] = useState<'private' | 'unlisted' | 'public'>('unlisted');
   const [uploadError, setUploadError] = useState<string | null>(null);
+  const { toast } = useToast();
 
   useEffect(() => {
     setIsAuthd(isAuthenticated());
@@ -48,8 +50,9 @@ function HomeContent() {
     if (authStatus === 'success') {
       setIsAuthd(true);
       window.history.replaceState({}, '', '/');
+      toast('Connected to YouTube', 'success');
     }
-  }, [searchParams]);
+  }, [searchParams, toast]);
 
   const handleRecordingComplete = (blob: Blob) => {
     setVideoBlob(blob);
@@ -88,9 +91,13 @@ function HomeContent() {
         privacyStatus,
         tags: ['screen recording', 'youtube loom'],
       });
-      setYoutubeUrl(getYouTubeUrl(videoId));
+      const url = getYouTubeUrl(videoId);
+      setYoutubeUrl(url);
+      toast('Video uploaded successfully!', 'success');
     } catch (error) {
-      setUploadError(error instanceof Error ? error.message : 'Upload failed');
+      const msg = error instanceof Error ? error.message : 'Upload failed';
+      setUploadError(msg);
+      toast(msg, 'error');
     } finally {
       setUploading(false);
     }

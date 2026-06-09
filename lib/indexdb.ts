@@ -115,59 +115,6 @@ export class IndexedDBStorage {
   }
 
   /**
-   * Get chunks in batches for streaming upload
-   */
-  async *getChunksBatch(batchSize: number = 10): AsyncGenerator<VideoChunk[]> {
-    if (!this.db) {
-      await this.init();
-    }
-
-    const transaction = this.db!.transaction([STORE_NAME], 'readonly');
-    const store = transaction.objectStore(STORE_NAME);
-    const index = store.index('recordingId');
-
-    const request = index.openCursor(IDBKeyRange.only(this.recordingId));
-
-    let batch: VideoChunk[] = [];
-
-    return new Promise((resolve, reject) => {
-      request.onsuccess = (event) => {
-        const cursor = (event.target as IDBRequest<IDBCursorWithValue>).result;
-
-        if (cursor) {
-          batch.push(cursor.value as VideoChunk);
-
-          if (batch.length >= batchSize) {
-            // Yield batch
-            const currentBatch = [...batch];
-            batch = [];
-            resolve(
-              (async function* () {
-                yield currentBatch;
-              })()
-            );
-          }
-
-          cursor.continue();
-        } else {
-          // Yield remaining chunks
-          if (batch.length > 0) {
-            resolve(
-              (async function* () {
-                yield batch;
-              })()
-            );
-          }
-        }
-      };
-
-      request.onerror = () => {
-        reject(new Error('Failed to retrieve chunks in batches'));
-      };
-    });
-  }
-
-  /**
    * Combine all chunks into a single Blob
    */
   async combineChunks(): Promise<Blob> {

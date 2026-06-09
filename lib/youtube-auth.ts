@@ -6,7 +6,6 @@ const YOUTUBE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
 const YOUTUBE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const YOUTUBE_SCOPES = [
   'https://www.googleapis.com/auth/youtube.upload',
-  'https://www.googleapis.com/auth/youtube',
 ];
 
 const TOKEN_STORAGE_KEY = 'youtube_oauth_token';

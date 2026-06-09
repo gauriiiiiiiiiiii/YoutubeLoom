@@ -299,9 +299,9 @@ export class ScreenRecorder {
   static isSupported(): boolean {
     return !!(
       navigator.mediaDevices &&
-      navigator.mediaDevices.getDisplayMedia &&
-      navigator.mediaDevices.getUserMedia &&
-      window.MediaRecorder
+      typeof navigator.mediaDevices.getDisplayMedia === 'function' &&
+      typeof navigator.mediaDevices.getUserMedia === 'function' &&
+      typeof window.MediaRecorder !== 'undefined'
     );
   }
 }

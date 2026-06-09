@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import RecordingControls from '@/components/RecordingControls';
 import UploadProgress from '@/components/UploadProgress';
@@ -18,6 +18,14 @@ import {
 } from '@/lib/youtube-upload';
 
 export default function Home() {
+  return (
+    <Suspense fallback={<div className="flex min-h-screen items-center justify-center">Loading...</div>}>
+      <HomeContent />
+    </Suspense>
+  );
+}
+
+function HomeContent() {
   const searchParams = useSearchParams();
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);

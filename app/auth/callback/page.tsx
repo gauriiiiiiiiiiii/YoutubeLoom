@@ -1,10 +1,25 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, Suspense } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { exchangeCodeForToken } from '@/lib/youtube-auth';
 
 export default function AuthCallback() {
+  return (
+    <Suspense fallback={
+      <main className="flex min-h-screen flex-col items-center justify-center p-24">
+        <div className="text-center">
+          <div className="mb-4 text-4xl">🔄</div>
+          <h1 className="text-2xl font-bold mb-4">Loading...</h1>
+        </div>
+      </main>
+    }>
+      <AuthCallbackContent />
+    </Suspense>
+  );
+}
+
+function AuthCallbackContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const [error, setError] = useState<string | null>(null);

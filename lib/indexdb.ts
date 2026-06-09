@@ -122,7 +122,7 @@ export class IndexedDBStorage {
       await this.init();
     }
 
-    const transaction = this.db.transaction([STORE_NAME], 'readonly');
+    const transaction = this.db!.transaction([STORE_NAME], 'readonly');
     const store = transaction.objectStore(STORE_NAME);
     const index = store.index('recordingId');
 

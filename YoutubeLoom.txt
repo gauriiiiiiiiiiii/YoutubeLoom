@@ -1,0 +1,259 @@
+================================================================================
+                           YOUTUBЕЛOOM — COMPLETE PROJECT REFERENCE
+================================================================================
+
+Live URL : https://youtubeloom.vercel.app
+GitHub   : https://github.com/gauriiiiiiiiiiii/YoutubeLoom
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. WHAT IS THIS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+YoutubeLoom is a browser-based screen recorder that uploads directly to
+YouTube. No backend storage, no file size limits, no third-party services.
+
+Key features:
+  - Screen recording (up to 1920x1080 @ 30fps)
+  - Microphone audio mixed with system audio
+  - Webcam picture-in-picture overlay (4 corners, size 10–40%)
+  - Direct YouTube upload via resumable upload protocol
+  - Title / description / privacy (public/unlisted/private)
+  - Automatic token refresh (no mid-session re-auth)
+  - Toast notifications — zero alert() calls
+  - Stale IndexedDB chunks purged on every page load
+
+Tech stack:
+  Next.js 15 (App Router) · React 19 · TypeScript 5 · Tailwind CSS 3
+  MediaRecorder API · Canvas API · IndexedDB
+  Google OAuth 2.0 · YouTube Data API v3
+  Vitest · @testing-library/react · fake-indexeddb
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. FOLDER & FILE STRUCTURE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+YoutubeLoom/
+├── .env.local                    ← Real credentials (gitignored)
+├── .env.local.example            ← Template for the 3 required vars
+├── next.config.ts                ← Minimal Next.js config
+├── tailwind.config.ts            ← Inter font family, surface/border colors, spin-slow
+├── tsconfig.json                 ← @/* alias, strict TypeScript
+├── vitest.config.ts              ← jsdom env, React plugin, @/* alias
+│
+├── app/
+│   ├── globals.css               ← Dark theme (#0a0a0a), Inter via CSS var, animations
+│   ├── layout.tsx                ← Inter font, ToastProvider, favicon metadata
+│   ├── page.tsx                  ← Main page: Home (Suspense wrapper) + HomeContent
+│   └── auth/callback/page.tsx   ← AuthCallback (Suspense wrapper) + AuthCallbackContent
+│   └── api/auth/
+│       ├── exchange/route.ts     ← POST: code → access + refresh token (server-side)
+│       └── refresh/route.ts      ← POST: refresh token → new access token (server-side)
+│
+├── components/
+│   ├── RecordingControls.tsx     ← Idle/recording/processing states, webcam toggle
+│   ├── WebcamPreview.tsx         ← 4-corner position picker + size range slider
+│   ├── UploadProgress.tsx        ← Uploading/processing/complete/error states
+│   └── Toaster.tsx               ← ToastProvider context + useToast() hook
+│
+├── lib/
+│   ├── recorder.ts               ← ScreenRecorder class (MediaRecorder, getDisplayMedia)
+│   ├── compositor.ts             ← VideoCompositor class (Canvas webcam PiP at 15fps)
+│   ├── indexdb.ts                ← IndexedDBStorage (store/combine/clear chunks)
+│   ├── youtube-auth.ts           ← OAuth: startOAuthFlow, storeToken, getValidAccessToken
+│   └── youtube-upload.ts        ← YouTubeUploader (resumable upload, 5MB chunks, retry)
+│
+├── public/
+│   └── favicon.svg               ← SVG record-button icon (dark square + red/white circles)
+│
+└── tests/
+    ├── setup.ts                  ← jest-dom import, localStorage mock, clipboard mock
+    ├── lib/
+    │   ├── youtube-auth.test.ts  ← isTokenExpired, storeToken, getStoredToken, isAuthenticated
+    │   ├── youtube-upload.test.ts ← generateDefaultTitle, getYouTubeUrl, upload + error paths
+    │   └── indexdb.test.ts       ← init, storeChunk, getAllChunks, combine, clear, clearAll
+    └── components/
+        ├── Toaster.test.tsx      ← Renders toast, auto-dismiss (fake timers), success/error styling
+        ├── UploadProgress.test.tsx ← All 4 statuses: uploading, processing, complete, error
+        └── WebcamPreview.test.tsx  ← 4 corner buttons, active highlight, size label, callbacks
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. ENV VARIABLES (REQUIRED)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  NEXT_PUBLIC_YOUTUBE_CLIENT_ID
+    Visibility: browser + server
+    Source: Google Cloud Console → Credentials → OAuth 2.0 Client ID
+    Example: 123456789-abc.apps.googleusercontent.com
+
+  NEXT_PUBLIC_YOUTUBE_REDIRECT_URI
+    Visibility: browser + server
+    Value: must match EXACTLY what is set in Google Console
+      Local:      http://localhost:3000/auth/callback
+      Production: https://youtubeloom.vercel.app/auth/callback
+
+  YOUTUBE_CLIENT_SECRET
+    Visibility: SERVER ONLY — never prefix with NEXT_PUBLIC_
+    Source: Google Cloud Console → same OAuth credential
+
+How to get credentials:
+  1. console.cloud.google.com → new project
+  2. Enable YouTube Data API v3
+  3. APIs & Services → Credentials → Create → OAuth 2.0 Client ID (Web app)
+  4. Add Authorized JavaScript origins: http://localhost:3000
+  5. Add Authorized redirect URIs: http://localhost:3000/auth/callback
+  6. OAuth Consent Screen → Audience → Publish App (for public access)
+  7. Copy Client ID and Client Secret into .env.local
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. HOW THE APP WORKS (FULL FLOW)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+AUTH FLOW
+  "Connect to YouTube"
+  → startOAuthFlow() builds Google auth URL with youtube.upload scope
+  → Browser redirects to accounts.google.com/o/oauth2/v2/auth
+  → Google redirects to /auth/callback?code=XXXX
+  → AuthCallbackContent reads code, POSTs to /api/auth/exchange
+  → Server uses YOUTUBE_CLIENT_SECRET to exchange code for access + refresh tokens
+  → Tokens saved to localStorage (accessToken, refreshToken, expiresAt)
+  → Redirect to /?auth=success → toast "Connected to YouTube"
+
+RECORDING FLOW
+  "Start Recording"
+  → ScreenRecorder.start()
+  → getDisplayMedia({ video: { frameRate: 30 } }) — screen
+  → getUserMedia({ video: webcam, audio: mic }) — webcam + mic
+  → VideoCompositor.start(screenStream, webcamStream):
+      - Canvas draws screen frame at native resolution
+      - Webcam drawn as PiP in selected corner at selected % size
+      - Output: 15fps Canvas stream
+  → AudioContext merges screen audio + mic audio
+  → MediaRecorder records (Canvas stream + merged audio)
+  → Every 5s: onDataAvailable → IndexedDBStorage.storeChunk(blob)
+
+STOP FLOW
+  User clicks stop / browser stop-sharing button
+  → onStop callback fires
+  → setIsProcessing(true) — spinner shown
+  → db.combineChunks() — all chunks merged into single Blob
+  → db.clearChunks() — IndexedDB cleaned
+  → db.close()
+  → setIsProcessing(false) — video preview shown
+
+UPLOAD FLOW
+  "Upload to YouTube"
+  → getValidAccessToken() — refreshes via /api/auth/refresh if expired
+  → YouTubeUploader.upload(blob, { title, description, privacyStatus })
+    1. POST to YouTube upload endpoint → get Location URL (resumable session)
+    2. Loop: slice 5MB chunk → PUT with Content-Range header
+       - 308 → continue to next chunk
+       - 200/201 → capture data.id (video ID), done
+       - 5xx → exponential backoff retry (up to 3x)
+  → getYouTubeUrl(videoId) → show "View on YouTube" + "Copy Link"
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. KEY IMPLEMENTATION DETAILS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+SECURITY
+  - YOUTUBE_CLIENT_SECRET never reaches the browser
+  - Token exchange and refresh happen server-side (API routes)
+  - OAuth scope: youtube.upload only (minimum required)
+
+OAUTH APP STATUS
+  - Published to production (not in test mode) so any Google account can authorize
+  - Shows "unverified app" warning; users continue via "Advanced → Go to YoutubeLoom"
+
+SUSPENSE WRAPPERS
+  - app/page.tsx: Home wraps HomeContent in <Suspense> (required for useSearchParams)
+  - app/auth/callback/page.tsx: AuthCallback wraps AuthCallbackContent in <Suspense>
+
+TOKEN EXPIRY
+  - isTokenExpired() uses a 5-minute buffer: treats tokens as expired 5min before actual expiry
+  - getValidAccessToken() auto-refreshes if expired and refresh token exists
+  - Falls back to null (unauthenticated) if refresh fails or no refresh token
+
+INDEXEDDB CHUNK STORAGE
+  - DB: youtube-loom-db, store: video-chunks, indexes: recordingId + timestamp
+  - Each IndexedDBStorage instance has a unique recordingId (Date.now() by default)
+  - On mount: clearAllRecordings() called to clean up chunks from crashed sessions
+  - combineChunks() sorts by timestamp before merging
+
+UPLOAD VIDEO ID CAPTURE
+  - Video ID is captured from the 200/201 response body of the final chunk (data.id)
+  - Not from a separate API call — avoids the extra empty PUT bug
+
+TOAST SYSTEM
+  - ToastProvider (app/layout.tsx) wraps the entire app
+  - useToast() returns { toast(message, kind) }
+  - Auto-dismissed after 4 seconds
+  - Kinds: 'success' (green), 'error' (red), 'info' (white/gray)
+  - No external dependencies
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. TESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Framework: Vitest + @testing-library/react + fake-indexeddb
+Test count: 42 tests in 6 files — all passing
+
+  tests/lib/youtube-auth.test.ts
+    - isTokenExpired: not expired, expired, within 5-min buffer
+    - storeToken/getStoredToken: with/without refresh token, returns null when empty
+    - clearStoredToken: removes all 3 localStorage keys
+    - isAuthenticated: false when empty, true when valid, false when expired
+
+  tests/lib/youtube-upload.test.ts
+    - generateDefaultTitle: contains "Screen Recording", matches format
+    - getYouTubeUrl: correct watch URL format
+    - YouTubeUploader.upload: success path (mocked fetch), initiate failure, no Location URL
+
+  tests/lib/indexdb.test.ts (uses fake-indexeddb + IDBKeyRange from fake-indexeddb)
+    - init: resolves without error
+    - storeChunk: returns auto-increment IDs
+    - getAllChunks: filters by recordingId, correct count
+    - combineChunks: returns Blob with video/webm type, size > 0
+    - clearChunks: removes only current recording's chunks
+    - clearAllRecordings: removes everything
+    - getTotalSize: returns a number without throwing
+
+  tests/components/Toaster.test.tsx
+    - Renders toast message after firing
+    - Auto-dismisses after 4s (fake timers)
+    - Success styling (green), error styling (red)
+    - Multiple toasts simultaneously
+
+  tests/components/UploadProgress.test.tsx
+    - Uploading: label + percentage + bytes info
+    - Processing: label + hint text
+    - Complete: YouTube URL + View on YouTube link + Copy Link button
+    - Error: error message displayed
+
+  tests/components/WebcamPreview.test.tsx
+    - Renders all 4 corner buttons
+    - Active button has blue highlight
+    - onPositionChange called on click
+    - Size percentage displayed
+    - Active position label shown
+
+NOT TESTED (browser-only APIs):
+  - lib/recorder.ts — requires MediaRecorder, getDisplayMedia (no jsdom support)
+  - lib/compositor.ts — requires Canvas, requestAnimationFrame
+  - app/api/auth/*.ts — Next.js server route internals
+  - app/page.tsx / RecordingControls.tsx — complex browser integration tests omitted
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. QUICK START
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  npm install
+  cp .env.local.example .env.local    # fill in 3 credentials
+  npm run dev                          # http://localhost:3000
+  npm run test:run                     # run all 42 tests
+
+================================================================================

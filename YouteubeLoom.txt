@@ -21,7 +21,7 @@ CONTENTS
    13. Intentional design decisions
    14. Known rough edges
    15. Quick reference (keys, schemas, numbers)
-   16. Interview deep-dives (hard questions & answers)
+   16. Interview prep (pitch, STAR story, and hard Q&A)
 
 
 ================================================================================
@@ -716,22 +716,113 @@ npm SCRIPTS
 
 
 ================================================================================
-16. INTERVIEW DEEP-DIVES (HARD QUESTIONS & ANSWERS)
+16. INTERVIEW PREP (PITCH, STAR STORY, AND HARD Q&A)
 ================================================================================
 
-The walkthrough covers "what it does." These are the "why" and "what breaks"
-questions a sharp interviewer asks. Each has a crisp answer you can say out loud.
+Everything above explains WHAT the project is. This section is for talking about
+it out loud: the pitch, the story of why it exists, and the "why / what-breaks"
+questions a sharp interviewer asks. Facts trace to the real code; the motivation
+is the honest background - a solo build, born from a real personal need.
+
+
+--- THE 30-SECOND PITCH (TECHNICAL) -----------------------------------------
+
+"YouTube Loom is a client-heavy Next.js app that records your screen - plus mic
+and an optional webcam picture-in-picture - and uploads it straight to your own
+YouTube channel. The bet is that the browser does ALL the heavy lifting:
+MediaRecorder + Canvas for capture, IndexedDB as an on-disk buffer so a 3-hour
+recording never crashes the tab, and a hand-rolled resumable upload straight to
+the YouTube Data API. The only backend is two tiny Next.js routes that hold the
+OAuth secret. So there's no server storage, no bandwidth cost, and no file-size
+limit - videos go from my tab to my channel and touch nothing in between."
+
+
+--- THE 30-SECOND PITCH (NON-TECHNICAL / RECRUITER) -------------------------
+
+"It's a free screen recorder that sends your video straight to YouTube. Most
+tools either cap how long you can record, make you download a huge file and
+upload it by hand, or store your videos on their servers. I wanted none of that -
+so I built one where the recording happens entirely in your own browser and goes
+directly to your own YouTube channel. Nothing is stored anywhere in between, and
+there's no limit on how long you can record."
+
+
+--- THE STAR STORY ----------------------------------------------------------
+
+SITUATION
+I regularly needed to record my screen and get it onto YouTube - walkthroughs,
+demos, tutorials. Every tool had the same friction: Loom caps free recordings,
+plain screen recorders dump a giant file I then upload by hand, and anything that
+stored my videos server-side meant paying or trusting someone else with my
+content. Browser-based ones would crash the tab on long recordings. I wanted
+something that recorded my screen and pushed it straight to MY OWN channel, with
+no length limit and nothing stored on a server I don't control.
+
+TASK
+Build exactly that, solo: a browser app that captures screen + mic + optional
+webcam, handles arbitrarily long recordings without crashing, and uploads
+directly to YouTube - while staying essentially free to host and never touching
+my video data server-side.
+
+ACTION
+I made a deliberate architectural bet: push all the heavy lifting into the
+browser so there's no server storage or bandwidth cost. Four things made it work:
+
+  1. RECORDING - combined getDisplayMedia, getUserMedia, and an AudioContext
+     mixing bus to merge screen, mic, and system audio into one stream. For
+     webcam PiP, I composite the webcam over the screen on a hidden <canvas> at
+     15fps and use captureStream() to turn it back into one video track.
+
+  2. THE NO-LIMITS PROBLEM - instead of holding the whole video in RAM, I have
+     MediaRecorder emit a 5-second chunk every 5s and stream each one straight to
+     IndexedDB (on disk). Memory stays flat whether it's 30 seconds or 3 hours.
+     On stop, I reassemble the chunks in timestamp order.
+
+  3. DIRECT UPLOAD - implemented YouTube's resumable upload protocol by hand:
+     announce metadata to get a session URL, then send the file in 5MB
+     Content-Range PUTs, with exponential-backoff retries on 5xx errors.
+
+  4. SECURITY - OAuth needs a client_secret that can't live in the browser, so I
+     added two tiny Next.js API routes as a secret-relay; the browser only ever
+     sees the resulting token. I scoped the request to youtube.upload only -
+     least privilege, and it sidesteps Google's restricted-scope audit.
+
+  I also wrote a 42-test suite (Vitest) covering the auth logic, the upload state
+  machine with mocked fetch, and IndexedDB via fake-indexeddb.
+
+RESULT
+It does exactly what I needed: record, edit title/privacy, hit upload, get a
+YouTube link - no length ceiling, zero server storage cost, deployed as a static
+site plus two stateless functions on Vercel. The hardest-won piece was the
+resumable-upload state machine (see the deep-dive below). If I took it further:
+httpOnly cookies for tokens, an OAuth CSRF state parameter, and finishing the
+resume-on-dropped-connection path I stubbed but didn't complete.
+
+  A note on metrics: this project has no "10k users" or "40% faster" number - its
+  wins are CAPABILITY wins (no length ceiling, no storage cost, direct upload).
+  Frame results around those, not a fabricated stat. The strongest concrete
+  "result" is a true anecdote if you have one - e.g. "I've recorded multi-hour
+  sessions and memory never spikes." Use a real story over an invented metric.
+
+
+--- THE PROJECT ITSELF (context questions) ----------------------------------
+
+Q: Why did you build this?
+A: A real personal need - record to YouTube without length caps, manual
+   re-uploads, or handing my videos to a third-party server. Nothing did all
+   three, so I built it.
+
+Q: Was it solo or a team?
+A: Solo - architecture, recording pipeline, upload engine, auth, UI, and tests
+   are all mine.
+
+Q: What are you most proud of?
+A: The "no file-size limit" design. The 5-second-chunk -> IndexedDB pattern means
+   peak memory is basically constant no matter how long you record - that's the
+   idea the whole app is built around.
 
 
 --- ARCHITECTURE & DESIGN ---------------------------------------------------
-
-Q: Give me the 30-second summary of the architecture.
-A: A client-heavy Next.js app. The browser does capture (MediaRecorder +
-   Canvas), buffering (IndexedDB), and upload (fetch to YouTube's resumable
-   endpoint). The server is two API routes that exist only to keep the OAuth
-   client_secret off the browser. Data flows: getDisplayMedia/getUserMedia ->
-   optional Canvas compositing -> MediaRecorder emits 5s chunks -> IndexedDB ->
-   combineChunks() on stop -> resumable 5 MB PUTs to YouTube.
 
 Q: Why no backend for the video itself? What's the trade-off?
 A: Cost and simplicity - we never store or egress gigabytes, so hosting is
@@ -886,6 +977,17 @@ A: The resumable upload state machine - specifically that the video id comes fro
    an extra empty PUT to fetch the id and that returned a YouTube API error;
    capturing id inline from the last chunk fixed it. Getting the Content-Range
    math and the 308-vs-200 handling exact was the fiddly part.
+
+
+--- REHEARSAL CHECKLIST -----------------------------------------------------
+
+  [ ] Say the technical pitch out loud until it's ~30s and natural.
+  [ ] Say the non-technical pitch to someone who doesn't code.
+  [ ] Run the STAR story end to end without reading it.
+  [ ] Be able to open any file in lib/ and explain it (Sections 4-8).
+  [ ] Have the GitHub link + a live demo ready to show.
+  [ ] Pre-load the "what I'd improve" answer - volunteering the localStorage /
+      CSRF / resume gaps shows you know the limits before they dig.
 
 
 ================================================================================

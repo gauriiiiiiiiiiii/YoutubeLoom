@@ -1,0 +1,3041 @@
+================================================================================
+                                 YOUTUBE LOOM
+=================================================================================
+
+   HOW THIS DOCUMENT IS ORGANISED
+
+      Sections 1-3    the shape of the project: what it is, what it is built
+                      from, and how a recording travels from screen to YouTube.
+      Sections 4-10   the code, one area per section. Each one owns its subject
+                      completely, including its own bugs.
+      Sections 11-14  synthesis: a ranked bug ledger, a security review, scaling
+                      and trade-offs, and a one-page reference card.
+
+      Every term is explained at the point where it first matters, in the section
+      that owns it. Nothing is defined twice, so if a concept looks unexplained,
+      it is explained in the section referenced next to it.
+
+   CONTENTS
+
+      1.  The mental model - what it is and the one big bet
+      2.  The tech stack - every choice and why
+      3.  The end-to-end flow - the five steps
+      4.  Capture - screen, mic, and audio mixing
+      5.  Compositor - the canvas webcam overlay
+      6.  IndexedDB - the "no size limit" trick
+      7.  Auth - OAuth 2.0 and the secret relay
+      8.  Upload - the resumable protocol
+      9.  The React layer - state machine and components
+      10. Testing - what is covered, what is not, and why
+      11. The bug ledger - everything ranked
+      12. Security review - threat model and blast radius
+      13. Scalability and trade-offs
+      14. Cheat sheet - the one page to read last
+
+
+================================================================================
+                     Section 1 - the mental model
+                     what it is and the one big bet
+================================================================================
+
+   WHAT IT IS, IN ONE LINE
+
+      A web app that records your screen, plus your microphone, plus an optional
+      webcam picture-in-picture, and uploads the result straight to your own
+      YouTube channel.
+
+   THE PROBLEM IT SOLVES
+
+      Four kinds of friction with the existing tools, none of which any single
+      tool fixed:
+
+         1. Length caps          Loom's free tier cuts you off at five minutes.
+         2. Manual re-upload     A plain screen recorder drops a 2 GB file on
+                                 your desktop, and you upload it by hand.
+         3. Someone else's disk  Server-side tools store your video on their
+                                 infrastructure. You pay for it, and you have to
+                                 trust them with it.
+         4. Tab crashes          Naive browser recorders hold the whole video in
+                                 memory, so a long recording kills the tab.
+
+   THE ONE BIG BET
+
+      >> The browser does all the heavy lifting. The server holds one secret. <<
+
+      Every design decision in this project falls out of that sentence. Capture,
+      buffering, stitching and uploading all happen on the user's machine. The
+      video never passes through a server we own.
+
+      The only backend is two small functions whose entire job is to keep the
+      OAuth client secret out of the browser. No database, no file storage, no
+      video processing, no queue.
+
+         +-------------------------------------------------+
+         |  THE USER'S BROWSER  (does 99% of the work)     |
+         |                                                 |
+         |   record --> buffer to disk --> stitch --> PUT --+--> YouTube
+         |                                                 |     (Google's
+         +----------------------+--------------------------+      servers)
+                                |
+                                | "sign this token request for me"
+                                v
+                     +---------------------------+
+                     |  OUR SERVER (2 functions) |
+                     |  holds client_secret only |
+                     +---------------------------+
+
+   WHAT THE BET BUYS, AND WHAT IT COSTS
+
+      The full accounting is in Section 13. The short version:
+
+         BUYS    no storage or bandwidth cost, no file-size ceiling, privacy as
+                 an architectural fact rather than a policy promise, and scaling
+                 that is linear because each user brings their own CPU.
+         COSTS   no server-side processing of any kind, no cross-device resume,
+                 a hard dependency on YouTube, exposure to browser capability
+                 differences, and nowhere safe to keep an OAuth token.
+
+      That last cost is the one that produces a real security trade-off rather
+      than a missing feature. Section 12 covers it.
+
+
+================================================================================
+                     Section 2 - the tech stack
+                          every choice and why
+================================================================================
+
+   THE INSIGHT THAT EXPLAINS THE DEPENDENCY LIST
+
+      The three hardest things this app does - record video, overlay a webcam,
+      and buffer gigabytes without crashing - are all free, built-in browser
+      features. MediaRecorder, Canvas and IndexedDB ship with every modern
+      browser. There is no ffmpeg, no WebAssembly, no media server and no npm
+      video library anywhere in the project.
+
+      So the honest framing is that this is clever glue. The skill on display is
+      knowing which browser primitives exist and wiring them together correctly,
+      not writing a codec. That is why the entire production dependency list is
+      three packages:
+
+         "dependencies": {
+           "next":      "^15.1.6",
+           "react":     "^19.0.0",
+           "react-dom": "^19.0.0"
+         }
+
+   THE FRAMEWORK LAYER
+
+      Next.js 15, App Router          resolved 15.5.12
+         What it does   Serves the UI and hosts the two server functions, in one
+                        project, with one deploy.
+         Why chosen     Two reasons only. It gives server-side API routes in the
+                        same repository as the frontend, so the OAuth secret
+                        relay costs no extra infrastructure; and it deploys to
+                        Vercel in one command.
+         The obvious    "Why Next.js if it is 99% client-side?" Fair challenge,
+         challenge      and the answer is to concede it. There is no SSR and no
+                        ISR for the app itself - the home page is a client
+                        component. A plain Vite SPA plus one serverless function
+                        would also work. Next just bundles both halves into one
+                        mental model.
+
+      React 19                        resolved 19.2.4
+         Why chosen     The UI is genuinely state-driven - idle, recording,
+                        processing, preview, uploading, done - and "UI is a
+                        function of state" maps onto that cleanly.
+
+      TypeScript 5, strict            resolved 5.9.3
+         Why chosen     The browser media APIs have fiddly shapes: MediaStream,
+                        MediaStreamTrack, Blob, IDBRequest. Types catch "you
+                        passed a stream where a track was expected" before
+                        runtime.
+         Config         strict: true is on. The path alias @/* maps to the
+                        repository root.
+
+      Tailwind CSS 3                  resolved 3.4.19
+         Why chosen     Styling lives next to the markup, so there are no
+                        separate CSS files to keep in sync for a small UI. The
+                        dark theme is hardcoded.
+
+   THE BROWSER APIs, AND WHICH SECTION OWNS EACH
+
+      These five do the actual work. Each is explained where it is used rather
+      than here, because the reason each was chosen only makes sense alongside
+      the code:
+
+         MediaRecorder                       Section 4
+         getDisplayMedia / getUserMedia      Section 4
+         Web Audio API (AudioContext)        Section 4
+         Canvas 2D + captureStream           Section 5
+         IndexedDB                           Section 6
+
+      Section 14 has all five compressed to one line each, for revision.
+
+   THE EXTERNAL SERVICES
+
+      Google OAuth 2.0        proves the user owns the channel being uploaded to.
+                              The scope is youtube.upload only. Section 7.
+      YouTube Data API v3     receives the video, over the resumable upload
+                              protocol, hand-rolled rather than pulled in via
+                              Google's client library. Section 8.
+
+   THE TESTING STACK
+
+      Vitest 4                resolved 4.1.8. Fast, Jest-compatible API,
+                              configured with globals: true and a jsdom
+                              environment.
+      jsdom 29                a fake DOM so component tests run in Node. Its
+                              limitations are the whole testing story - see
+                              Section 10.
+      @testing-library/react
+      + user-event            renders components and simulates real clicks.
+      fake-indexeddb 6        a real, spec-compliant IndexedDB in memory.
+
+      Current state is 42 tests across 6 files, all passing. The per-file
+      breakdown and what each strategy is for are in Section 10.
+
+   DEPLOYMENT
+
+      Vercel. The build output is three prerendered static routes - /,
+      /_not-found and /auth/callback - plus two dynamic serverless functions for
+      the auth routes. First Load JS for the home page is about 112 kB. Nothing
+      is stateful, so it scales horizontally for free.
+
+      Every "why not X instead" question about the stack is answered in the
+      trade-off ledger in Section 13, because each of those choices cost
+      something and the cost is the interesting half.
+
+
+================================================================================
+                     Section 3 - the end-to-end flow
+                              the five steps
+================================================================================
+
+   This section is the spine. It gives the order of events and hands off to the
+   deep dives for the mechanics, so nothing here is explained twice.
+
+   THE WHOLE THING ON ONE LINE
+
+      log in -> record -> buffer to disk -> stop and stitch -> upload in slices
+
+   THE MAP
+
+      +--------+   +----------+   +-----------+   +-----------+   +----------+
+      | 1. LOG |-->| 2.RECORD |-->| 3. STORE  |-->| 4. STOP + |-->| 5.UPLOAD |
+      |    IN  |   |  SCREEN  |   |  CHUNKS   |   |  COMBINE  |   |  TO YT   |
+      |        |   |  MIC/CAM |   |(IndexedDB)|   |  CHUNKS   |   |          |
+      +--------+   +----------+   +-----------+   +-----------+   +----------+
+       once per     one click      every 5s        on stop        one click
+       session                     (repeats)
+
+      Step 3 is the only one that loops, and that loop is the whole trick of the
+      project. It is why recording length is unlimited.
+
+   WHICH FILE OWNS WHICH STEP
+
+      Step 1  log in       lib/youtube-auth.ts, app/auth/callback/page.tsx,
+                           app/api/auth/exchange/route.ts          Section 7
+      Step 2  record       lib/recorder.ts, lib/compositor.ts    Sections 4, 5
+      Step 3  buffer       lib/indexdb.ts                          Section 6
+      Step 4  stitch       lib/indexdb.ts (combineChunks)           Section 6
+      Step 5  upload       lib/youtube-upload.ts                    Section 8
+      All     orchestrate  app/page.tsx, components/RecordingControls.tsx
+                                                                    Section 9
+
+   STEP 0 - PAGE LOAD, BEFORE THE USER DOES ANYTHING
+
+      1. app/layout.tsx wraps every page in ToastProvider and loads the Inter
+         font. That single wrap is why any component can call useToast().
+      2. app/page.tsx renders Home, which is only a Suspense shell around
+         HomeContent. Section 9 explains why that boundary is mandatory.
+      3. HomeContent's mount effect calls isAuthenticated(), which reads
+         localStorage. This is how login survives a refresh; there is no session
+         on any server.
+      4. RecordingControls mounts and immediately calls
+         new IndexedDBStorage().clearAllRecordings() to wipe chunks orphaned by
+         a previously crashed tab. It is written to be safe to run repeatedly,
+         which matters because React StrictMode double-invokes effects in
+         development.
+
+   STEP 1 - LOG IN, ONCE, THEN IT PERSISTS
+
+      The user clicks "Connect to YouTube". startOAuthFlow() navigates the whole
+      page to Google's consent screen; Google redirects back to /auth/callback
+      with a short-lived code; the callback page POSTs that code to our own
+      /api/auth/exchange, which adds the client secret and trades it with Google
+      for tokens; the tokens go into localStorage; the user lands back on / with
+      ?auth=success, which the home page reads and then scrubs from the URL.
+
+      If the user declines, Google redirects with ?error= instead, and the
+      callback page shows it and returns home after three seconds.
+
+      Every parameter, every token, and the reason the exchange has to happen
+      server-side are in Section 7.
+
+   STEP 2 - RECORD, ONE CLICK AND SEVERAL PERMISSION PROMPTS
+
+      1. ScreenRecorder.isSupported() guards, so an unsupported browser fails
+         fast.
+      2. A new IndexedDBStorage is constructed and initialised. Its recordingId
+         defaults to a timestamp, which is how one session's chunks stay
+         separate from another's.
+      3. A new ScreenRecorder is handed three callbacks. This is the seam where
+         the recorder and the database are wired together:
+               onDataAvailable -> db.storeChunk(blob)     (that is step 3)
+               onStop          -> combine and hand off    (that is step 4)
+               onError         -> show the error and toast
+      4. await rec.start() acquires the screen, then the microphone, then the
+         webcam if enabled; merges them down to exactly one video track and one
+         audio track; picks a codec; constructs the MediaRecorder; and calls
+         start(5000). The ordering, the merging and the codec choice are all
+         Section 4.
+      5. The UI switches to the recording view: a one-second timer and a
+         two-second poll of db.getTotalSize() showing "X MB saved".
+
+      If the user cancels the screen picker, the promise rejects, cleanup()
+      releases anything already opened, and the error surfaces. No half-open
+      camera or microphone is left running.
+
+   STEP 3 - STORE CHUNKS, THE LOOP THAT MATTERS
+
+      Every five seconds, for the entire recording:
+
+         MediaRecorder fires ondataavailable with a small Blob
+            -> the recorder passes it to onDataAvailable
+            -> RecordingControls calls await db.storeChunk(blob)
+            -> IndexedDB stores { blob, timestamp, recordingId }
+
+      WHY THIS IS THE WHOLE TRICK
+
+         Naive way                          This way
+         ---------                          --------
+         Hold the entire video in a JS      Each 5s piece goes straight to disk
+         array until the user stops         and is released from memory
+         A one-hour recording is            Peak memory stays flat whether you
+         gigabytes in the heap, and the     record for 30 seconds or 3 hours
+         tab dies
+         A crash loses everything           Chunks already on disk survive
+
+      FIRST, KILL THE OBVIOUS OBJECTION
+
+         "The total size is the same either way." Correct, and important to say
+         out loud, because it proves you understand what is actually being
+         optimised. A one-hour recording is about 1.2 GB of video bytes no matter
+         how you handle it.
+
+         The win is not total bytes. The win is peak bytes, and where they live.
+
+            RAM  is scarce, volatile, and shared with the whole page.
+            DISK is plentiful, persistent, and cheap.
+
+         So the trick is not "store less". It is "never hold more than one small
+         piece in the scarce place at any one moment".
+
+      THE NUMBERS
+
+                                 Naive: one growing array   This way: 5s chunks
+                                 ------------------------   -------------------
+         Total video bytes          ~1.2 GB per hour           ~1.2 GB per hour
+                                       (identical)                (identical)
+         PEAK live memory           grows to the full          ~1.6 MB
+                                    ~1.2 GB                    (one chunk)
+         Where the bulk lives       JS heap / page memory      disk (IndexedDB)
+         Limited by                 the tab memory ceiling     origin storage
+                                    (the browser kills it)     quota (tens of GB)
+
+         Peak RAM of about 1.6 MB against about 1.2 GB is the entire argument,
+         and it is a constant-versus-linear difference: naive memory grows with
+         recording length, this stays flat. Section 4 derives both numbers from
+         the bitrate constants.
+
+      THE SECOND, QUIETER BENEFIT
+
+         Bytes on disk survive a tab crash. The chunks are physically still there
+         after the browser dies.
+
+         The app does not use that, though. On the next page load
+         RecordingControls calls clearAllRecordings(), which wipes orphaned
+         chunks rather than offering to recover them. So crash durability is
+         something the design makes possible but the product throws away.
+         "I get durability for free and currently discard it" is a better answer
+         than pretending recovery exists.
+
+      The timestamp on every chunk is not decoration. It is how correct order is
+      guaranteed later, even if the asynchronous database writes resolve out of
+      order.
+
+   STEP 4 - STOP AND COMBINE
+
+      There are two ways to stop and both land in the same place: the app's red
+      stop button, and the browser's own floating "Stop sharing" bar, which
+      Section 4 explains how the code hooks.
+
+      1. mediaRecorder.stop(), then cleanup(). cleanup() stops every track,
+         which is what turns off the webcam light and clears the browser's
+         sharing indicator.
+      2. MediaRecorder flushes one final ondataavailable and only then fires
+         onstop, so the last few seconds are not lost.
+      3. The onStop callback shows a spinner, awaits db.combineChunks(), clears
+         the buffer, closes the connection, and hands the finished Blob up to
+         page.tsx.
+      4. combineChunks() reads this recording's chunks through the recordingId
+         index, sorts them by timestamp, and concatenates them into one Blob.
+         Section 6 explains why that concatenation is almost free.
+      5. page.tsx stores the Blob and creates a preview URL with
+         URL.createObjectURL.
+      6. The UI switches again: RecordingControls unmounts and the preview card
+         appears, with a video player, editable title, description and privacy,
+         and Download and Upload buttons.
+
+   STEP 5 - UPLOAD
+
+      1. getValidAccessToken() returns either a working token or a clean null,
+         refreshing behind the scenes if needed. Section 7 has the decision tree.
+      2. A YouTubeUploader is constructed with that token and a progress
+         callback wired straight into React state, which is why the bar moves.
+      3. upload() opens a resumable session, PUTs the file in five-megabyte
+         slices, and pulls the video id out of the final response. Section 8.
+      4. The watch URL is set and a success toast fires.
+
+   WHERE EACH STEP RUNS - THE "NO SERVER" CLAIM MADE CONCRETE
+
+      Step 1  login exchange     OUR SERVER   (two small functions, tokens only)
+      Step 2  capture            BROWSER
+      Step 3  buffer to disk     BROWSER      (the user's own disk)
+      Step 4  stitch             BROWSER
+      Step 5  upload             BROWSER ---> GOOGLE, directly
+
+      Video bytes touch our infrastructure exactly zero times. The only thing
+      our server ever handles is a short-lived token request.
+
+   THE FAILURE BRANCH AT EVERY STEP
+
+      A favourite interview angle, and each entry is covered in full by the
+      section that owns it:
+
+      Step 1  consent denied         Google redirects with ?error, the callback
+                                     page shows it and returns home.
+      Step 2  picker cancelled       getDisplayMedia rejects, cleanup() releases
+                                     everything, the error is shown.
+      Step 2  no system audio        Not an error. Only the mic reaches the mixer.
+      Step 3  disk quota exhausted   storeChunk rejects, and the rejection is
+                                     never caught, so chunks are silently lost.
+                                     Section 4.
+      Step 4  nothing was recorded   combineChunks returns an empty Blob rather
+                                     than throwing. Section 6.
+      Step 5  token expires mid-way  Not re-checked between chunks, so a very
+                                     long upload starts failing. Section 8.
+      Step 5  network drops          Errors out. True resume is an unwired
+                                     function. Section 8.
+
+
+================================================================================
+                     Section 4 - capture
+                     screen, mic, and audio mixing
+================================================================================
+   file: lib/recorder.ts   (309 lines, class ScreenRecorder)
+
+   THE PROBLEM IN ONE SENTENCE
+
+      Up to four independent sources have to become one file, and the thing doing
+      the recording will accept only one video track and one audio track.
+
+      That single constraint explains every design decision in this file. It is
+      why a canvas compositor exists, and it is why an AudioContext exists.
+      Neither is there to be clever; both are there because MediaRecorder will
+      not take four inputs.
+
+   THE FOUR SOURCES
+
+      Source        API used            Always present?   Ends up as
+      ------        --------            ---------------   ----------
+      Screen video  getDisplayMedia     yes               the video track
+      Screen audio  getDisplayMedia     no - optional     mixed into the audio
+      Microphone    getUserMedia        yes               mixed into the audio
+      Webcam video  getUserMedia        no - opt-in       painted onto a canvas
+
+      Screen audio is the one people forget. The browser only provides it if the
+      user ticked "share audio" in the picker, and some platforms and some share
+      types will not offer it at all. So the code has to treat it as
+      maybe-absent, and it does: line 108 checks screenAudioTracks.length > 0
+      before touching it.
+
+   THE TWO CAPTURE APIs, AND WHY THEY DIFFER
+
+      navigator.mediaDevices.getDisplayMedia()   ->  screen, window, or tab
+      navigator.mediaDevices.getUserMedia()      ->  microphone or camera
+
+      Both return a Promise<MediaStream> and both are permission-gated. The
+      differences that matter:
+
+         getUserMedia    asks for a DEVICE. The permission can be remembered by
+                         the browser, so the second time it may not prompt.
+
+         getDisplayMedia asks WHAT DO YOU WANT TO SHARE. It shows a picker every
+                         single time and is never remembered, by design - a site
+                         must never be able to watch a screen silently.
+
+      The second difference is the one worth knowing: getDisplayMedia requires
+      TRANSIENT USER ACTIVATION. It has to be called while the browser still
+      considers it "the user just clicked something". getUserMedia has no such
+      requirement.
+
+   WHY THE ORDER OF THE THREE REQUESTS MATTERS
+
+      Lines 42-74 request screen, then microphone, then webcam - three awaits, in
+      that order.
+
+         click "Record"
+              |
+              v
+         [1] await getDisplayMedia()   <- picker. MUST be first
+              |
+              v
+         [2] await getUserMedia(audio) <- microphone prompt
+              |
+              v
+         [3] await getUserMedia(video) <- webcam prompt, only if enabled
+
+      Screen has to go first because of the activation rule above. If the
+      microphone came first and the user stared at that prompt for a few seconds,
+      the click activation would have expired by the time getDisplayMedia ran,
+      and it would throw InvalidStateError. Screen-first is not an accident; it
+      is the only ordering that is safe.
+
+      The cost of this design is up to three permission dialogs back to back
+      before anything happens. That is a real usability wart and worth naming as
+      one.
+
+   WHAT HAPPENS IF THE USER SAYS NO
+
+      A cancelled picker or a denied prompt REJECTS the promise; it does not
+      return an empty stream. So one try/catch around all three (line 40) covers
+      every refusal, and the handler at lines 168-176 does three things in a
+      deliberate order:
+
+         1. cleanup()          release anything already acquired
+         2. onError(err)       tell the UI
+         3. throw recordError  tell the caller too
+
+      Step 1 is the one that matters. If the user approved the screen and
+      microphone but then denied the webcam, the screen and microphone are
+      already live. Without that cleanup() call they would be left staring at a
+      "sharing your screen" bar for a recording that never started.
+
+   MENTAL MODEL: A STREAM IS JUST A BAG OF TRACKS
+
+      MediaStream        =  a container
+      MediaStreamTrack   =  one actual feed of video or audio
+
+      A stream can hold several tracks, and tracks can be moved between streams
+      with addTrack(). The tracks are the real things; streams are just handles.
+
+      This is why line 77 constructs `new MediaStream()` with nothing in it and
+      then fills it. It is building an empty bag and choosing exactly two tracks
+      to put in it.
+
+   THE VIDEO SIDE - ONE TRACK, TWO PATHS
+
+      if the webcam is ON                    if the webcam is OFF
+      -------------------                    --------------------
+      VideoCompositor paints screen and      the raw screen video track goes
+      webcam onto a canvas, and              straight into combinedStream
+      canvas.captureStream() yields a        (line 98)
+      new video track (line 91)
+
+      Either way exactly one video track lands in combinedStream. In the webcam
+      case the raw screen track is not added - it stays alive because the
+      compositor is reading from it, but it is not what gets recorded. Section 5
+      covers how the painting works.
+
+   THE AUDIO SIDE - THE QUESTION INTERVIEWERS ACTUALLY ASK
+
+      "You have screen audio and mic audio. Why not just addTrack() both?"
+
+      Because a WebM file carries one audio track, and MediaRecorder encodes one
+      audio track. Hand it two and the second is ignored, so you would silently
+      lose either the microphone or the system audio depending on order. Nothing
+      errors. That is the worst kind of bug.
+
+      Two sounds have to become one sound before the recorder sees them. That is
+      signal processing, and the Web Audio API is the tool for it.
+
+      THE GRAPH   (lines 103-123)
+
+         screen audio track ---> createMediaStreamSource ---\
+                                                             \
+                                                              --> destination
+                                                             /        |
+         mic audio track ------> createMediaStreamSource ---/         |
+                                                                     v
+                                                         destination.stream
+                                                                     |
+                                                                     v
+                                                     ONE mixed audio track
+                                                     -> combinedStream
+
+      In plain words:
+
+         new AudioContext()                a small audio processing engine
+         createMediaStreamDestination()    a node that turns audio back INTO a
+                                           MediaStream you can record
+         createMediaStreamSource(stream)   a node that turns a MediaStream INTO
+                                           audio the engine can work with
+         source.connect(destination)       plug one into the other
+
+      Both sources connect to the SAME destination, so they sum - which is
+      exactly what mixing is. Line 120 then pulls the single output track out and
+      drops it in the bag. Two in, one out.
+
+      Notice line 110: `new MediaStream([screenAudioTracks[0]])`. The screen
+      stream also holds a video track, and createMediaStreamSource wants an
+      audio-only stream, so the code wraps that one audio track in a fresh
+      stream. A small thing that trips people up.
+
+   THE AUDIO CONSTRAINT FLAGS
+
+      echoCancellation    stop the speakers feeding back into the microphone
+      noiseSuppression    filter steady background noise such as fans and hum
+      autoGainControl     even out volume as the speaker leans in and out
+      sampleRate: 44100   ask for CD-rate audio
+
+      All three of the first flags are set on the microphone, which is right for
+      a talking-head recording. Two of them are also set on the SCREEN audio at
+      lines 49-50, which is a little odd - they are microphone-oriented
+      processing and are most likely ignored on a display-capture track.
+      Harmless, but if an interviewer points at it, agreeing is the correct
+      answer.
+
+      Note also that the webcam request at lines 67-73 asks for video only. That
+      is deliberate: asking for audio there would hand you a second microphone
+      track competing with the real one.
+
+   CONSTRAINTS: IDEAL VERSUS EXACT
+
+      width: { ideal: 1920 }     "prefer 1920, but give me what you have"
+      width: { exact: 1920 }     "1920 or fail"
+      width: 1920                shorthand for ideal
+      width: { min: 1280 }       a hard floor, so it fails below that
+
+      Everything in this file uses `ideal`, which is the right call. Using `exact`
+      on a screen capture is close to guaranteed failure: you have no idea what
+      resolution the user's monitor is, and they might share a small window.
+      `ideal` degrades instead of throwing.
+
+         screen  1920 x 1080 @ 30fps  (ideal)
+         webcam  1280 x  720 @ 30fps  (ideal)
+
+      What you actually get is whatever the source can deliver. A 1280x800 laptop
+      screen gives you 1280x800, not an error.
+
+   THE CODEC LADDER   (getSupportedMimeType, lines 279-294)
+
+      Try each in order and take the first the browser admits to supporting:
+
+         1. video/webm;codecs=vp9,opus     best compression
+         2. video/webm;codecs=vp8,opus     older, near-universal
+         3. video/webm;codecs=h264,opus    Safari-ish territory
+         4. video/webm                     let the browser decide
+
+      Why a ladder at all: MediaRecorder.isTypeSupported() varies by browser and
+      even by OS build, and passing an unsupported mimeType to the MediaRecorder
+      constructor throws. So you probe rather than assume.
+
+      Why WebM rather than MP4: WebM is what browser MediaRecorder support
+      actually is. VP9 gives better quality per byte than H.264, and Opus beats
+      AAC at speech bitrates. YouTube ingests WebM happily, so there is no reason
+      to fight for MP4. The trade-off is that the local Download button hands the
+      user a file some desktop software and some Safari versions will not play.
+
+      The fallback at line 293 returns 'video/webm' even when nothing matched,
+      which is slightly optimistic - but a browser supporting none of the four
+      was never going to record anyway.
+
+   THE BITRATES, AND WHERE 1.2 GB PER HOUR COMES FROM
+
+      videoBitsPerSecond: 2_500_000    2.5 Mbps
+      audioBitsPerSecond:   128_000    128 kbps
+
+      2.5 Mbps is a sensible screen-recording number: text and UI are mostly
+      static, so the codec has an easy job, and it sits well inside what a home
+      connection can upload. 128 kbps Opus is comfortably transparent for speech.
+
+      This is the derivation every other section refers back to:
+
+         2.5 Mbps + 128 kbps  =  2.628 Mbps
+                              =  ~330 KB per second
+                              =  ~19.7 MB per minute
+                              =  ~1.2 GB per hour
+
+      And with a five-second timeslice, one chunk is about 5 x 330 KB, or roughly
+      1.6 MB. Those two numbers - 1.2 GB per hour, 1.6 MB per chunk - are the
+      whole memory argument in Section 3.
+
+      Being able to derive this out loud is worth more than reciting it. If
+      pushed, 2.5 Mbps is honestly thin for 1080p text, and raising it is the
+      first thing to change for quality.
+
+   THE ONE LINE THAT MAKES THE WHOLE ARCHITECTURE WORK
+
+      line 160         this.mediaRecorder.start(5000)
+
+      Without the argument, MediaRecorder buffers the entire recording and fires
+      ondataavailable exactly once, at the end. With 5000 it fires every five
+      seconds with the slice it has just encoded. That argument is called the
+      TIMESLICE, and it is the single reason chunked storage is possible.
+
+      The handler at lines 134-141 is deliberately tiny: skip empty blobs, keep a
+      reference, hand the chunk to the callback. It does not await anything, which
+      is the source of a real bug covered below.
+
+   THE BROWSER'S OWN STOP BUTTON
+
+      When you share a screen, the browser shows its own floating "Stop sharing"
+      bar. That is browser chrome - the page cannot see it or style it, and users
+      will absolutely reach for it instead of the app's button.
+
+      If you ignore it, the track dies, MediaRecorder keeps running against a
+      dead source, and the app sits there claiming to record nothing.
+
+      Lines 163-167 handle it:
+
+         screenVideoTrack.onended = () => { this.stop(); }
+
+      One line, and now the browser's button and the app's button do the same
+      thing. This is a very good detail to mention unprompted, because it is
+      exactly the kind of thing that separates someone who has shipped a capture
+      feature from someone who has read the documentation page.
+
+   CLEANUP - WHY THE CAMERA LIGHT IS A CORRECTNESS ISSUE
+
+      cleanup() at lines 247-274 walks every stream it ever opened and calls
+      track.stop() on each.
+
+      A MediaStreamTrack holds the hardware. Dropping the JavaScript reference
+      does NOT release it: the camera light stays on, the microphone stays hot,
+      and the "you are sharing your screen" bar stays up. Only stop() releases it.
+
+      So this is not tidiness, it is a privacy guarantee the user can literally
+      see. A recorder that leaves the webcam light on after stopping looks like
+      spyware, quite reasonably so. cleanup() is called from both stop() and the
+      error path, which is the correct pair of places.
+
+   ROUGH EDGES IN THIS FILE
+
+      [!] THE AUDIOCONTEXT IS NEVER CLOSED   (line 103)
+
+          const audioContext = new AudioContext();
+
+          A local const. It is never assigned to `this`, so once start() returns,
+          nothing can reach it and close() can never be called. Every
+          record/stop cycle leaks one.
+
+          This is not a vague "memory leak"; it has a concrete failure. Browsers
+          cap how many AudioContexts a page may hold open - Chrome's limit has
+          historically been six - so after enough record/stop cycles without a
+          refresh, `new AudioContext()` throws and recording stops working
+          entirely until the page is reloaded.
+
+          The fix is two lines: store it as this.audioContext, and
+          await this.audioContext.close() inside cleanup().
+
+      [!] THE CHUNK HANDLER SWALLOWS FAILURES   (lines 137-139)
+
+          onDataAvailable(event.data) is called with no await and no .catch().
+          That callback returns a promise that writes to IndexedDB. If the write
+          rejects - disk quota, private-mode restrictions - it becomes an
+          unhandled promise rejection. The recorder carries on cheerfully while
+          chunks vanish, and the user only finds out at the end.
+
+      [!] this.chunks IS DEAD WEIGHT   (line 136)
+
+          Every chunk is also pushed into an in-memory array so that stop() can
+          build a Blob from it (lines 190-195). But the caller throws that return
+          value away: RecordingControls.tsx:110 calls recorder?.stop() and
+          ignores the result, then rebuilds the Blob from IndexedDB instead. So
+          the array is never read and should be deleted.
+
+          Blob references are not necessarily heap bytes - browsers back large
+          blobs with disk - so the practical damage is small. But it is still
+          holding what it claims to release.
+
+      [!] THE MEDIARECORDER ERROR MESSAGE IS USELESS   (line 152)
+
+          new Error(`MediaRecorder error: ${event}`)
+
+          `event` is an Event object, and interpolating it into a template string
+          produces the literal text "[object Event]". So every MediaRecorder
+          failure reports the same meaningless message. It should read the error
+          off the event instead.
+
+      [!] pause() AND resume() ARE UNREACHABLE   (lines 203-216)
+
+          Both are implemented correctly and no UI ever calls them. Either wire
+          up a pause button or drop them.
+
+   THE SUPPORT CHECK
+
+      isSupported() at lines 299-306 verifies that mediaDevices exists, that both
+      getDisplayMedia and getUserMedia are functions, and that MediaRecorder is
+      defined. That is feature detection rather than user-agent sniffing, which
+      is the right instinct - and it is a static method, so the UI can check
+      before it ever offers a record button.
+
+
+================================================================================
+                     Section 5 - compositor
+                       the canvas webcam overlay
+================================================================================
+   file: lib/compositor.ts   (215 lines, class VideoCompositor)
+
+   WHY THIS FILE EXISTS
+
+      Section 4 established the rule: MediaRecorder takes one video track. The
+      webcam feature needs two pictures in one video. No amount of stream
+      plumbing satisfies both.
+
+      So the trick is to stop treating them as two videos. Paint both onto a
+      canvas, fifteen times a second, and then record THE CANVAS. A canvas can
+      produce a video track via canvas.captureStream(), and as far as
+      MediaRecorder is concerned that is just one ordinary video feed.
+
+      Say it as: "I do not merge two video tracks, because you cannot. I re-draw
+      them into one."
+
+   THE PIPELINE
+
+      screen track ---> <video> element ---\
+                                            \
+                                             --> drawImage onto <canvas>
+                                            /            |
+      webcam track ---> <video> element ---/             | captureStream(15)
+                                                         v
+                                                 ONE video track
+                                                         |
+                                                         v
+                                                  MediaRecorder
+
+      Note what the video elements are for. A MediaStreamTrack is not something
+      you can draw; drawImage() accepts an image, a canvas, or a video element.
+      So each stream is attached to a video element purely to turn "a stream"
+      into "something paintable".
+
+   THE SETUP
+
+      constructor (lines 22-23)
+
+         document.createElement('canvas')
+         getContext('2d', { alpha: false })
+
+         alpha: false is a deliberate performance choice. There is no
+         transparency in a screen recording, and telling the browser that lets it
+         skip per-pixel alpha blending on every draw. A small, free win.
+
+      start() (lines 44-62)
+
+         canvas.width  = screenTrack.getSettings().width  || 1920
+         canvas.height = screenTrack.getSettings().height || 1080
+
+         getSettings() reports what the track actually negotiated, not what was
+         asked for. So the canvas matches the real shared screen: if the user
+         shared a 1280x800 window, the canvas is 1280x800 and nothing is
+         letterboxed or stretched. The 1920x1080 is only a fallback.
+
+         screenVideo.srcObject = screenStream
+         webcamVideo.srcObject = webcamStream
+         screenVideo.muted = true
+         webcamVideo.muted = true
+         await screenVideo.play()
+         await webcamVideo.play()
+
+      THREE THINGS TO NOTICE HERE, ALL WORTH POINTS
+
+         1. The video elements are never added to the DOM. They exist only as
+            pixel sources, and drawImage() reads from a detached video element
+            perfectly well as long as it is playing.
+
+         2. muted = true is not cosmetic, for two reasons. Autoplay policy means
+            an unmuted video cannot call play() without a user gesture, so play()
+            would reject. And an unmuted element playing the SCREEN stream would
+            pump the system audio back out of the speakers, into the microphone,
+            and straight into the recording - a howling echo.
+
+         3. play() is awaited so the loop does not start drawing from a video
+            that has no frames yet, which would paint black.
+
+   THE GEOMETRY   (lines 65-75)
+
+      webcamWidth  = canvas.width * webcamSize / 100      // 20% of screen width
+      webcamHeight = webcamWidth * 9 / 16                 // assumes 16:9
+      padding      = 20                                   // px from the edge
+
+      Sizing by percentage rather than pixels is the right instinct: a fixed
+      320px overlay is huge on a 1280-wide screen and a postage stamp on a 4K
+      one. Twenty per cent of the width looks the same everywhere.
+
+      getWebcamPosition() (lines 162-183) is then corner arithmetic:
+
+         +---------------------------------------+
+         | (pad, pad)          (W-w-pad, pad)    |
+         |   top-left            top-right       |
+         |                                       |
+         |                                       |
+         |   bottom-left         bottom-right    |
+         | (pad, H-h-pad)      (W-w-pad, H-h-pad)|
+         +---------------------------------------+
+
+      Left edges are simply `padding`. Right and bottom edges subtract the
+      overlay's own size as well, because canvas coordinates address the
+      top-left of what you draw. That is the only thing to get right here, and
+      it is right.
+
+   THE DRAW LOOP   (lines 81-113)
+
+      const frameInterval = 1000 / frameRate;      // 15fps -> 66.67ms
+      let lastFrameTime = 0;
+
+      const composite = (timestamp) => {
+        if (timestamp - lastFrameTime >= frameInterval) {
+           ... draw ...
+           lastFrameTime = timestamp;
+        }
+        this.animationId = requestAnimationFrame(composite);
+      };
+
+      requestAnimationFrame fires at the display's refresh rate, typically 60fps.
+      That is four times more often than needed, so the timestamp check skips
+      three out of every four calls. The loop still runs at 60fps, but the
+      expensive drawing happens at 15.
+
+      WHY 15fps AND NOT 30 OR 60
+
+         Each frame copies a full screen-sized image plus a webcam image. At
+         1920x1080 that is roughly two million pixels per drawImage, and doing it
+         sixty times a second on the main thread will make the whole page
+         stutter - including the thing the user is trying to demonstrate.
+
+         Screen content is mostly static: text, UI, a cursor. 15fps looks
+         perfectly acceptable for that and costs a quarter of the CPU. "I chose
+         15 because compositing runs on the main thread and I would rather drop
+         frames than make the demo janky" is a strong answer.
+
+      THE DRAWING ITSELF   (lines 84-105)
+
+         drawImage(screenVideo, 0, 0, W, H)     full-bleed background
+         save()                                 remember the clean state
+         roundRect(...)                         build a rounded-corner path
+         clip()                                 confine drawing to that path
+         drawImage(webcamVideo, x, y, w, h)     webcam, corners clipped off
+         strokeStyle / lineWidth / stroke()     a faint white outline
+         restore()                              drop the clip
+
+      save() and restore() are essential. clip() is permanent until undone, so if
+      you never restore, the next frame's full-screen drawImage is still confined
+      to that little rounded rectangle and the recording turns into a tiny webcam
+      box on black.
+
+      roundRect() (lines 188-207) is hand-rolled from lineTo and
+      quadraticCurveTo - four straight edges and four corner curves. Modern
+      canvas has a native ctx.roundRect(), so this does by hand what the platform
+      now offers, but it works everywhere and it is only twelve lines.
+
+   HANDING BACK A TRACK   (line 116)
+
+      this.compositeStream = this.canvas.captureStream(this.options.frameRate)
+
+      This is the payoff line. It returns a MediaStream whose video track is
+      "whatever is on this canvas, sampled at 15fps". recorder.ts:91 pulls that
+      one track out and records it.
+
+   STOPPING   (lines 144-157)
+
+      cancelAnimationFrame(animationId)       stop burning CPU
+      compositeStream tracks -> stop()        release the canvas track
+      null out the stream references
+
+      Cancelling the animation frame matters. Without it the loop keeps drawing
+      forever after recording ends, pinning a core for the lifetime of the page.
+
+   ROUGH EDGES - AND ONE OF THEM IS SERIOUS
+
+      [!!] rAF DOES NOT RUN IN A BACKGROUND TAB
+
+           Browsers stop requestAnimationFrame callbacks when a tab is hidden.
+           That is deliberate battery behaviour, and it is fatal here.
+
+           Think about what a screen recorder is FOR. The user starts a recording
+           in this tab, then switches to the app they want to demonstrate. The
+           Loom tab is now hidden, rAF stops, and the canvas keeps the last frame
+           it drew. captureStream keeps emitting that same frozen frame while the
+           microphone carries on recording perfectly.
+
+           The result: with the webcam overlay on, the video freezes the moment
+           the user leaves the tab, and they get a still image with a voiceover.
+
+           Note the asymmetry. With the webcam off there is no canvas in the path
+           at all, so recording is completely unaffected. Turning on the webcam
+           is what introduces the failure.
+
+           The fix is to get compositing off the rAF clock and off the main
+           thread: move the drawing into a Web Worker with an OffscreenCanvas,
+           since workers are not throttled the way animation frames are. The
+           alternatives are the WebCodecs / MediaStreamTrackProcessor route, or
+           at minimum driving the loop from something that still ticks when
+           hidden. This is the first thing I would fix in the whole codebase.
+
+      [!] THE LIVE-ADJUST METHODS ARE DEAD CODE
+
+          Be precise about this one, because the obvious version of the claim is
+          wrong.
+
+          WHAT WORKS: choosing a corner or a size BEFORE recording does take
+          effect. The values live in React state, and RecordingControls.tsx:80
+          passes them into the ScreenRecorder constructor, which passes them to
+          the VideoCompositor constructor, which reads them at lines 65-75. Pick
+          top-left, get top-left.
+
+          WHAT DOES NOT EXIST: changing it DURING a recording. There are two
+          independent reasons, and both would have to be fixed:
+
+             1. The geometry is computed once, before the loop, into the local
+                consts webcamWidth, webcamHeight and webcamPos (lines 65-75). The
+                loop closes over those locals. updatePosition() and updateSize()
+                (lines 130-139) assign to this.options, which nothing inside the
+                loop ever reads again. Mutating them writes to a variable no one
+                looks at.
+
+             2. The controls are not even reachable mid-recording.
+                RecordingControls.tsx:136 early-returns a completely different UI
+                while isRecording is true, so WebcamPreview is only ever mounted
+                in the idle state - where `recorder` is still null. So
+                `recorder?.updateWebcamPosition(p)` at line 197 optional-chains
+                into nothing. It is a no-op on every single call.
+
+          So four methods - VideoCompositor.updatePosition and updateSize, and
+          ScreenRecorder.updateWebcamPosition and updateWebcamSize - are dead
+          weight that read as though live adjustment is supported.
+
+          The trap: wiring the panel into the recording UI looks like a
+          five-minute feature, and it would silently do nothing because of reason
+          1. The real fix is to read this.options inside the loop instead of
+          capturing locals, which is about four lines moved.
+
+      [!] THE 16:9 ASSUMPTION DISTORTS SOME WEBCAMS   (line 66)
+
+          webcamHeight = (webcamWidth * 9) / 16;   // "Assume 16:9"
+
+          The comment admits it. The webcam is requested at 1280x720, which is
+          16:9, but that is `ideal`, not `exact` - plenty of cameras deliver
+          640x480, which is 4:3. drawImage then squeezes a 4:3 image into a 16:9
+          box and the person on camera is horizontally stretched.
+
+          The fix is to read the real aspect ratio from
+          webcamStream.getVideoTracks()[0].getSettings(), exactly the way the
+          canvas size is derived from the screen track.
+
+      [!] CANVAS SIZE IS FROZEN AT START   (lines 48-49)
+
+          Set once from getSettings(). If the shared window is resized, or the
+          display resolution changes mid-recording, the track dimensions change
+          and the canvas does not - so the frame is stretched or squashed for the
+          rest of the recording. A `resize` handler on the track would fix it.
+
+      [!] TWO RATE LIMITERS FIGHTING
+
+          The loop throttles drawing to 15fps by hand, and captureStream(15) asks
+          the browser to sample at 15fps. Two independent clocks at the same
+          nominal rate will drift against each other, so some captured frames are
+          duplicates and some drawn frames are never captured. Not broken, but
+          uneven frame timing. Pick one: either captureStream(0) plus manual
+          requestFrame(), or an unthrottled draw loop with captureStream(15)
+          doing the sampling.
+
+      [!] THE BORDER IS HALF THE WIDTH IT ASKS FOR   (lines 101-103)
+
+          stroke() is called while the clip is still active, and a 2px stroke
+          straddles the path - 1px inside, 1px outside. The outside half is
+          clipped away, so the visible border is 1px, not 2. Cosmetic, but the
+          kind of detail that shows you actually read the code.
+
+      [!] THE COMPOSITOR COPIES AUDIO FOR NO REASON   (lines 118-122)
+
+          The screen audio tracks are added onto the canvas stream, but
+          recorder.ts:91 only ever takes the video track out of it, and audio is
+          mixed separately through the AudioContext. Harmless, but it is work
+          that achieves nothing, and it reads as though audio flows through the
+          compositor when it does not.
+
+      [!] SLIDER RANGE AND CLAMP DISAGREE
+
+          WebcamPreview.tsx:68-69 caps the slider at 40%, while line 138 clamps
+          to 50%. Harmless - the UI is stricter than the model - but two numbers
+          describing one limit will eventually drift apart.
+
+      [!] THE VIDEO ELEMENTS ARE NEVER PAUSED
+
+          stop() cancels the frame loop and releases the canvas track, but the
+          two video elements are never paused and their srcObject is never
+          cleared. In practice the closure holding them becomes unreachable and
+          garbage collection handles it, and the underlying tracks are stopped by
+          recorder.cleanup() anyway - so this is untidy rather than broken.
+
+   THE PERFORMANCE STORY, IF THEY PUSH ON IT
+
+      Per composited frame: one two-megapixel drawImage for the screen, a path
+      build, a clip, one roughly 80-kilopixel drawImage for the webcam, and a
+      stroke. At 15fps that is around 31 million pixels per second of copying, on
+      the main thread, while the browser is also encoding VP9 at 2.5 Mbps.
+
+      Mitigations already present: alpha: false, 15fps instead of 60, and a
+      canvas sized to the actual screen rather than something arbitrary.
+
+      The mitigation not present is getting off the main thread. OffscreenCanvas
+      in a worker would fix both the CPU contention and the background-tab freeze
+      at the same time, which is why it is the one change worth making here.
+
+
+================================================================================
+                     Section 6 - IndexedDB
+                       the "no size limit" trick
+================================================================================
+   file: lib/indexdb.ts   (214 lines, class IndexedDBStorage)
+
+   THE REQUIREMENT
+
+      Hold up to several gigabytes, from inside a browser tab, without keeping it
+      in RAM, and get it back in the right order at the end. Section 3 explains
+      why that is the requirement; this section is how it is met.
+
+   WHY INDEXEDDB AND NOT THE OTHER FOUR OPTIONS
+
+      Option                  Verdict
+      ------                  -------
+      localStorage            A 5-10 MB cap, strings only, and synchronous, so
+                              writing blocks the main thread. A blob would have
+                              to be base64-encoded, which inflates it by about a
+                              third. Hopeless.
+      sessionStorage          Identical limits, and cleared on tab close.
+      In-memory array         Peak RAM grows to the whole recording. Section 3.
+      Cache API               Would technically work and is blob-friendly, but it
+                              is modelled as an HTTP request/response store: no
+                              ordering, no indexes, no querying.
+      File System Access API  Genuinely better for this - real streaming writes
+                              to a real file. But it is Chromium-only and needs a
+                              file-picker gesture up front.
+      IndexedDB               A large fraction of free disk, asynchronous, stores
+                              Blob natively, indexed and ordered, available
+                              everywhere. The winner.
+
+      THE KEY FACT THAT MAKES IT WORK
+
+         IndexedDB stores a Blob NATIVELY. It is not stringified and not
+         base64-encoded. The browser writes the bytes to a file on disk and hands
+         back a reference.
+
+         This is the whole reason the design holds up. If IndexedDB only accepted
+         strings, the memory argument in Section 3 would collapse.
+
+   THE SCHEMA
+
+      database   'youtube-loom-db'   version 1
+        |
+        +-- object store  'video-chunks'
+              keyPath: 'id'   autoIncrement: true
+              |
+              +-- index 'recordingId'  (non-unique)  <- "give me one session"
+              +-- index 'timestamp'    (non-unique)  <- ordering
+
+      A stored record:
+
+         { id: 1,                        <- auto-assigned, monotonic
+           blob: Blob,                   <- about 1.6 MB of encoded video
+           timestamp: 1699999999999,     <- Date.now() at write time
+           recordingId: '1699999990000' }
+
+      Both indexes are correctly non-unique: one recording has many chunks, and
+      two chunks can share a millisecond.
+
+      autoIncrement matters more than it looks. It gives every chunk a
+      monotonically increasing primary key, which means insertion order is
+      recoverable even if timestamps tie.
+
+   THE CALLBACK-TO-PROMISE PATTERN
+
+      IndexedDB predates promises. Every operation is an object with onsuccess
+      and onerror handlers, so every method in this file has the same shape:
+
+         async storeChunk(blob) {
+           if (!this.db) await this.init();
+           return new Promise((resolve, reject) => {
+             const tx    = this.db.transaction([STORE], 'readwrite');
+             const store = tx.objectStore(STORE);
+             const req   = store.add({ blob, timestamp: Date.now(), recordingId });
+             req.onsuccess = () => resolve(req.result);
+             req.onerror   = () => reject(new Error('Failed to store chunk'));
+           });
+         }
+
+      That wrapper is the entire reason this file is 214 lines instead of 60. It
+      is boilerplate, and it is why libraries such as idb and Dexie exist.
+      Hand-rolling it is defensible for six operations and it shows you
+      understand the raw API - but "in production I would reach for idb" is the
+      right thing to add.
+
+   THE SEVEN OPERATIONS
+
+      init()                open the database, create the store on first run
+      storeChunk(blob)      one readwrite transaction, store.add()
+      getAllChunks()        index('recordingId').getAll(id), then sort
+      combineChunks()       stitch the blobs into one
+      clearChunks()         cursor over this recording's chunks, delete each
+      clearAllRecordings()  store.clear() - everything, all sessions
+      getTotalSize()        sum blob.size across this recording
+
+   onupgradeneeded - THE MIGRATION HOOK
+
+      This fires only when the version number in the code is higher than the
+      version on disk. It is the only place you may create or alter stores and
+      indexes.
+
+      The `if (!db.objectStoreNames.contains(STORE_NAME))` guard at line 45 is
+      correct practice: upgrade handlers must be idempotent, because a user's
+      browser could be at any older version.
+
+      The database is still at version 1, so there is no migration story yet. It
+      is worth knowing what the answer would be: bump DB_VERSION, and inside
+      onupgradeneeded switch on event.oldVersion to apply each step in turn.
+
+   THE LAZY-INIT GUARD
+
+      Every method starts with `if (!this.db) await this.init()`. That is
+      convenient, because callers cannot forget to initialise.
+
+      There is a small flaw: two concurrent calls can both observe null and both
+      open a connection, so the second overwrites this.db and the first
+      connection leaks. In practice storeChunk calls are five seconds apart and
+      init() is awaited before anything else, so it never bites. The clean fix is
+      to cache the init promise itself rather than the result.
+
+   WHY SORT BY TIMESTAMP AT ALL   (line 107)
+
+      index.getAll(recordingId) already returns records in index order, and for
+      records sharing an index key that means primary-key order - which, with
+      autoIncrement, is insertion order. So the sort is technically redundant.
+
+      It is not wrong, though. Array.prototype.sort has been required to be
+      stable since ES2019, so ties keep their existing relative order and the
+      sort cannot scramble anything. Belt and braces on the one thing that must
+      never break, since chunks in the wrong order produce a corrupt video.
+
+   COMBINING - WHY STITCHING A GIGABYTE IS ALMOST FREE   (line 123)
+
+      const blobs = chunks.map(c => c.blob);
+      return new Blob(blobs, { type: blobs[0]?.type || 'video/webm' });
+
+      This looks like it should load a gigabyte into RAM. It does not.
+
+      The Blob constructor does not read the bytes. It creates a new Blob that
+      REFERENCES the pieces it was given, in order. The data stays where it
+      already is, on disk. Reading only happens later, lazily, when something
+      actually asks for bytes: blob.slice() during upload, or the object URL the
+      video preview uses.
+
+      So storage and retrieval are both effectively streaming. Neither end of the
+      pipeline ever has to hold the whole file.
+
+      Note also that the MIME type is taken from the first chunk rather than
+      hardcoded, so it automatically matches whichever codec the ladder in
+      Section 4 settled on.
+
+   THE CONCURRENCY QUESTION - AND THE ANSWER MOST PEOPLE GET WRONG
+
+      "MediaRecorder fires a chunk every five seconds. The user hits stop. Could
+      combineChunks() run before the last chunk finishes writing and silently
+      drop it?"
+
+      The tempting answer is "yes, that is a race". It is wrong, and knowing why
+      is worth real credit.
+
+      IndexedDB transactions on overlapping scopes are ORDERED BY CREATION. A
+      readwrite transaction on 'video-chunks' must complete before any later
+      transaction touching that same store may start. So a readonly transaction
+      created after the final storeChunk is guaranteed to observe that write. The
+      database serialises them for you.
+
+      What is genuinely unsafe is different, and it is a real gap: if the final
+      storeChunk rejects, nobody finds out, because the callback is invoked
+      without being awaited or caught. So the failure mode is not "wrong order",
+      it is "a silently missing chunk". Section 4 covers it.
+
+   ROUGH EDGES
+
+      [!] getTotalSize() IS O(n) AND IT IS POLLED EVERY TWO SECONDS
+
+          getTotalSize() (lines 185-188) calls getAllChunks(), which fetches
+          every record for the recording just to add up blob.size. And
+          RecordingControls.tsx:44-52 runs it on a two-second interval to drive
+          the "X MB saved" label.
+
+          So the cost of that label grows with recording length: by minute 50
+          each poll is pulling about 600 records off disk, thirty times a minute.
+          The whole recording performs O(n^2) work for one piece of cosmetic
+          text.
+
+          Two clean fixes: keep a running total in memory as chunks are stored,
+          or use store.count() plus an accumulator. Neither needs to read the
+          records at all.
+
+      [!] clearAllRecordings() IS GLOBAL, AND IT RUNS ON MOUNT
+
+          Line 170 uses store.clear(), and RecordingControls.tsx:27-30 calls it
+          every time the component mounts, to clear leftovers from crashed
+          sessions.
+
+          Open the app in a second tab while the first is recording, and the new
+          tab's mount handler deletes the first tab's chunks mid-recording -
+          every stored chunk, all sessions.
+
+          This is also where crash recovery dies. Chunks genuinely survive a tab
+          crash, which is real durability for free, and the very next page load
+          deletes them instead of offering to recover.
+
+          The fix is already sitting in the schema: the recordingId index exists
+          precisely so a delete can be scoped. It should clear only sessions that
+          are provably stale.
+
+      [!] getStorageEstimate() IS NEVER CALLED
+
+          Lines 193-203 wrap navigator.storage.estimate() and nothing anywhere
+          imports it. Verified dead.
+
+          The irony is sharp: the app polls how much it has WRITTEN every two
+          seconds, but never once asks how much room is LEFT. The one number that
+          could warn a user before a long recording fails is computed by a
+          function nobody calls.
+
+      [!] STORAGE IS NOT MARKED PERSISTENT
+
+          navigator.storage.persist() is never requested, so the data is
+          best-effort and the browser is free to evict it under disk pressure -
+          exactly the pressure a multi-gigabyte recording creates. One await
+          would upgrade it.
+
+      [!] ONLY REQUEST ERRORS ARE HANDLED, NOT TRANSACTION ERRORS
+
+          Every method wires request.onerror but never transaction.onerror or
+          transaction.onabort. A transaction aborted for a reason not tied to a
+          single request leaves the promise pending forever - not rejected, just
+          never settled - so any caller awaiting it hangs silently.
+
+      [!] combineChunks() ON ZERO CHUNKS RETURNS AN EMPTY BLOB
+
+          It does not throw. So a recording that stored nothing produces a valid
+          zero-byte Blob, which flows onward to the preview and the upload as if
+          it were real. It should fail loudly.
+
+      [!] THE ERROR MESSAGES THROW AWAY THE CAUSE
+
+          reject(new Error('Failed to store chunk')) discards request.error, so a
+          QuotaExceededError and a permissions failure are indistinguishable to
+          the caller. That matters, because they need completely different user
+          messaging.
+
+      [!] recordingId DEFAULTS TO Date.now().toString()   (line 21)
+
+          Two instances constructed in the same millisecond share an id, and
+          their chunks interleave into one recording. Nothing currently does
+          that, but crypto.randomUUID() costs nothing and removes the class of
+          bug entirely.
+
+      [!] THE CONNECTION IS ONLY CLOSED ON THE HAPPY PATH
+
+          close() is called in the onStop handler (RecordingControls.tsx:87). If
+          recording fails, the connection stays open for the life of the page -
+          which also blocks any future version upgrade, since IndexedDB cannot
+          upgrade while a connection is open.
+
+
+================================================================================
+                     Section 7 - auth
+                     OAuth 2.0 and the secret relay
+================================================================================
+   files: lib/youtube-auth.ts        (196 lines, client)
+          app/api/auth/exchange/route.ts  (73 lines, server)
+          app/api/auth/refresh/route.ts   (70 lines, server)
+          app/auth/callback/page.tsx      (82 lines, client)
+
+   THE PROBLEM
+
+      Upload a video to the user's own YouTube channel, from a browser, without
+      ever seeing their Google password and without leaking the app's own
+      credentials to anyone who opens DevTools.
+
+      That is exactly what OAuth 2.0 was invented for.
+
+   WHAT OAUTH ACTUALLY IS
+
+      OAuth 2.0 is DELEGATED AUTHORISATION. Not authentication - it does not tell
+      you who someone is. It lets a user grant a third party limited, revocable
+      permission to act on their behalf at some service, without handing over
+      their password.
+
+      Three parties:
+
+         the user            owns the YouTube channel
+         Google              holds the account and enforces permissions
+         this app            wants permission to upload, and nothing else
+
+      And the shape of the deal: the user tells Google "let this app upload
+      videos", Google gives the app a token that only does that, and the user can
+      revoke it at any time from their Google account settings. The app never
+      touches the password.
+
+   THE FOUR CREDENTIALS - THE TABLE WORTH MEMORISING
+
+      Every OAuth confusion is really a mix-up between these four things.
+
+      Credential            What it is                Lives              If leaked
+      ----------            ----------                -----              ---------
+      client_id             the app's public name     in the browser     nothing.
+                                                      bundle             It is public
+                                                                         by design
+      client_secret         proof the app is really   SERVER ONLY        an attacker
+                            itself                                       can
+                                                                         impersonate
+                                                                         the whole
+                                                                         app
+      authorization code    a single-use, ~10-minute  in the redirect    low. Single
+                            voucher for tokens        URL               use, expires
+                                                                        fast, and
+                                                                        needs the
+                                                                        secret to
+                                                                        redeem
+      access token          the thing that actually   in the browser     upload access
+                            authorises API calls      (localStorage)     to that one
+                                                                         user's
+                                                                         channel for
+                                                                         up to an hour
+      refresh token         mints new access tokens   in the browser     the same
+                            indefinitely              (localStorage)     access, but
+                                                                         until it is
+                                                                         explicitly
+                                                                         revoked
+
+      The one-line version: anyone can copy a NAME. Only the holder of the SECRET
+      can prove identity. That is the entire reason for the split, and everything
+      below follows from it.
+
+   THE SECRET IS WHY A SERVER ROUTE EXISTS AT ALL
+
+      Everything else in this app runs in the browser. These two API routes exist
+      for exactly one reason: token exchange requires the client_secret, and a
+      secret in a browser is not a secret.
+
+      Google will not let you skip it either - exchanging an authorization code
+      for tokens requires client_secret for a "web application" client. So the
+      code has to make that call from somewhere the user cannot read. That
+      somewhere is a Next.js route handler, running on the server.
+
+         browser  --- code --->  /api/auth/exchange  --- code + secret --->  Google
+         browser  <-- tokens --  (secret stays here)  <-- tokens ----------  Google
+
+      The route is a RELAY. It reads process.env.YOUTUBE_CLIENT_SECRET, which
+      only exists in the server process, adds it to the request, and passes the
+      result back. The secret never crosses the network to the client.
+
+   NEXT_PUBLIC_ IS THE SECURITY BOUNDARY
+
+      This is the single most important thing to understand about the environment
+      variables here, and it is a favourite interview question.
+
+      In Next.js, any environment variable whose name starts with NEXT_PUBLIC_ is
+      INLINED INTO THE CLIENT BUNDLE AT BUILD TIME. It is not read at runtime and
+      it is not fetched from anywhere - the literal string is substituted into the
+      JavaScript that ships to the browser. Anything without the prefix exists
+      only in the server process.
+
+      So the prefix is not a naming convention. It is a declaration of "this is
+      public".
+
+         NEXT_PUBLIC_YOUTUBE_CLIENT_ID       public. Fine - it is the app's name
+         NEXT_PUBLIC_YOUTUBE_REDIRECT_URI    public. Fine - it is a URL Google
+                                             will send the browser to anyway
+         YOUTUBE_CLIENT_SECRET               NO PREFIX. Server only. This is the
+                                             boundary
+
+      RENAMING THAT LAST ONE TO NEXT_PUBLIC_YOUTUBE_CLIENT_SECRET WOULD PUBLISH
+      IT. One prefix, and the app's identity is in every visitor's DevTools -
+      readable by anyone who loads the page, and permanently baked into the
+      deployed bundle. There would be no error, no warning, and nothing would
+      stop working, which is what makes it dangerous.
+
+      The blast radius: an attacker with the client_id and client_secret can
+      impersonate the application to Google. They can run their own consent
+      screens under this app's name and identity, burn the project's API quota,
+      and get the OAuth client suspended. Rotating it invalidates every existing
+      token, so every user has to re-consent.
+
+      Verified in this repo: the secret is read only in the two route handlers,
+      via process.env.YOUTUBE_CLIENT_SECRET (exchange/route.ts:22 and
+      refresh/route.ts:22). It appears in no client file. .env is gitignored -
+      .gitignore lists both `.env*.local` and `.env` - and the tracked
+      .env.local.example contains names with empty values, which is the correct
+      pattern.
+
+   THE FULL FLOW, STEP BY STEP
+
+      [1] START   (startOAuthFlow, youtube-auth.ts:24-45)
+
+          Build a URL to Google's consent screen and set window.location.href.
+          A full page navigation, deliberately - not fetch, not an iframe. The
+          user must SEE they are on accounts.google.com, in the real address bar,
+          before typing a password. That visibility is the anti-phishing property
+          of the whole flow.
+
+          The parameters:
+
+             client_id       who is asking
+             redirect_uri    where to come back to. Must match the console
+                             registration EXACTLY - any difference and Google
+                             refuses, which is the single most common setup error
+             response_type   'code'  -> the authorization code flow
+             scope           what is being asked for
+             access_type     'offline' -> also issue a refresh token
+             prompt          'consent' -> always show the screen
+
+      [2] THE SCOPE   (lines 7-9)
+
+          https://www.googleapis.com/auth/youtube.upload
+
+          One scope, and it is the narrowest one that does the job. It grants
+          upload only - it cannot read the user's videos, cannot delete anything,
+          cannot touch playlists or comments or subscribers.
+
+          This is least privilege, and it is worth stating explicitly. Compare
+          .../auth/youtube, which is full read/write over the whole channel and
+          which many tutorials reach for by default. A narrow scope also gets a
+          less frightening consent screen, so more users say yes.
+
+      [3] access_type=offline AND prompt=consent
+
+          By default Google issues only an access token, valid about an hour. To
+          get a REFRESH token you must ask for offline access.
+
+          The subtlety worth knowing: Google returns a refresh token only on the
+          FIRST authorisation for a given user and client. Re-authorise later and
+          you get an access token with no refresh token - so if you did not store
+          the first one, you cannot get another without forcing a fresh consent.
+          prompt=consent does exactly that, which is why it is here.
+
+          The trade-off is that returning users see the consent screen every
+          single time, which is mildly annoying. For an app that must not lose
+          the refresh token, that is the right side of the trade.
+
+      [4] REDIRECT BACK   (app/auth/callback/page.tsx)
+
+          Google sends the browser to /auth/callback with either ?code=... or
+          ?error=access_denied. The page reads it with useSearchParams and
+          immediately POSTs the code to /api/auth/exchange.
+
+          Because useSearchParams is used, this page needs a Suspense boundary or
+          the production build fails. Section 9 explains why.
+
+      [5] EXCHANGE   (exchange/route.ts:33-47)
+
+          A form-urlencoded POST to https://oauth2.googleapis.com/token carrying
+          code, client_id, client_secret, redirect_uri, and
+          grant_type=authorization_code.
+
+          Form-encoded rather than JSON because the OAuth 2.0 spec says so. Send
+          JSON and Google rejects it - a classic hour lost to a 400.
+
+          Google replies with access_token, refresh_token and expires_in, and the
+          route hands them back to the browser.
+
+      [6] STORE   (storeToken, youtube-auth.ts:82-89)
+
+          Three localStorage keys:
+
+             youtube_oauth_token     the access token
+             youtube_refresh_token   the refresh token
+             youtube_token_expiry    an absolute millisecond timestamp
+
+          Note line 70: expiresIn is a RELATIVE number of seconds from Google, and
+          it is converted to an absolute timestamp with
+          Date.now() + expiresIn * 1000 before storage. Storing the relative value
+          would be useless after a page reload, since you would no longer know
+          when the clock started.
+
+      [7] REFRESH   (refreshAccessToken, lines 122-148)
+
+          POST the refresh token to /api/auth/refresh, which adds the secret and
+          calls Google with grant_type=refresh_token.
+
+          Line 140 keeps the EXISTING refresh token rather than expecting a new
+          one. That is correct: Google does not return a refresh token on a
+          refresh response, and overwriting it with undefined would break every
+          future refresh - a genuinely common bug.
+
+   THE VALVE EVERY API CALL GOES THROUGH
+
+      getValidAccessToken() (lines 153-179) is the only function the upload path
+      calls. It encapsulates the entire lifecycle:
+
+         is there a token?          no  -> return null, prompt sign-in
+         is it expired?             no  -> return it
+         is there a refresh token?  no  -> return null
+         refresh it                 ok  -> store and return the new one
+                                    fail -> clear everything, return null
+
+      Two details:
+
+         isTokenExpired() (lines 113-116) treats a token as expired FIVE MINUTES
+         before it really is. Without that buffer, a token with thirty seconds
+         left passes the check and then expires mid-upload. Five minutes is
+         generous and correct - it costs an occasional unnecessary refresh, which
+         is free, and it prevents a class of failure that is expensive.
+
+         Everything funnels through one function, so no caller has to think about
+         expiry. Callers get a usable token or null. That is the right shape.
+
+   ROUGH EDGES
+
+      [!!] NO state PARAMETER - THIS IS A REAL CSRF HOLE   (lines 34-41)
+
+           The authorisation URL omits `state`, and the callback therefore
+           validates nothing.
+
+           `state` is an opaque random value the app generates, stores locally,
+           and puts in the authorisation URL. Google returns it untouched on the
+           redirect. If the returned value does not match what was stored, the
+           response did not originate from a flow this browser started, and it
+           must be rejected.
+
+           Without it, here is the concrete attack:
+
+              1. The attacker starts an OAuth flow against THEIR OWN Google
+                 account and captures the redirect before the app consumes it, so
+                 they hold a valid authorization code for their account.
+              2. They get the victim to load
+                 https://the-app/auth/callback?code=ATTACKER_CODE - a link in an
+                 email, an <img> tag, anything that causes a GET.
+              3. The victim's browser hits the callback, which happily exchanges
+                 that code and writes the ATTACKER'S tokens into the victim's
+                 localStorage.
+              4. Every video the victim records now uploads to the attacker's
+                 YouTube channel.
+
+           This is session fixation via OAuth, and it is the textbook reason
+           `state` exists. The fix is about ten lines: generate
+           crypto.randomUUID(), stash it in sessionStorage, append it to the
+           auth URL, compare on return, and refuse on mismatch.
+
+      [!] TOKENS LIVE IN localStorage, SO ANY XSS TAKES THEM
+
+          localStorage is readable by any JavaScript running on the origin. One
+          XSS - a compromised dependency is the realistic route - and the
+          attacker reads the refresh token, which is the valuable one because it
+          mints access tokens indefinitely until revoked.
+
+          THE HONEST TRADE-OFF
+
+             What localStorage buys:  no backend, no session store, no database,
+                                      and tokens survive a reload.
+             What it costs:           XSS becomes total account-scope compromise
+                                      rather than a nuisance.
+             The alternative:         keep tokens server-side and hand the browser
+                                      an httpOnly, Secure, SameSite cookie - not
+                                      readable by JavaScript at all. That needs a
+                                      session store and a backend, which is
+                                      exactly the architecture this project set
+                                      out to avoid.
+
+          Two things make it less bad than it sounds: the scope is upload-only, so
+          the blast radius is "can post videos to your channel" rather than
+          "owns your Google account", and the user can revoke access from their
+          Google settings at any time.
+
+          The right answer in an interview is not to defend it. It is: "For a
+          client-only app with an upload-only scope this is an acceptable
+          trade-off, and I would name it as one. If this had a backend, tokens
+          would go in httpOnly cookies."
+
+      [!] ANY REFRESH FAILURE NUKES THE SESSION   (lines 171-175)
+
+          The catch around refreshAccessToken calls clearStoredToken() on ANY
+          error. A genuinely revoked token and a five-second network blip are
+          treated identically, so a brief loss of connectivity signs the user out
+          and forces a full re-consent. It should only clear on a definitive
+          invalid_grant from Google.
+
+      [!] THE ROUTES FORWARD GOOGLE'S RAW ERROR TO THE BROWSER
+
+          exchange/route.ts:53 and refresh/route.ts:51 both put Google's error
+          body into `details` in the JSON response. That is upstream text going
+          straight to an untrusted client, and it can leak internal detail about
+          the OAuth client configuration. Log it server-side; return something
+          generic.
+
+      [!] THE ROUTES ARE UNAUTHENTICATED AND UNTHROTTLED
+
+          Anyone can POST to either endpoint as many times as they like. Neither
+          checks a caller identity - which is unavoidable for exchange, since it
+          runs before any session exists - and neither has rate limiting. Section
+          12 works through what that actually costs.
+
+      [!] NO PKCE
+
+          PKCE is a proof-of-possession extension: the client generates a random
+          verifier, sends its hash up front, and presents the verifier at
+          exchange time, so a stolen code is useless without it.
+
+          Not strictly required here, because this is a confidential client - the
+          exchange happens server-side with a secret, so a stolen code cannot be
+          redeemed by an attacker anyway. But OAuth 2.1 makes PKCE mandatory for
+          all clients, so adding it is the forward-looking answer. "Not required
+          for a confidential client, recommended by 2.1, and I would add it" is
+          the complete response.
+
+      [!] THE ERROR MESSAGE NAMES THE WRONG FILE   (line 30)
+
+          It tells the developer to check .env.local; the project actually uses
+          .env. A one-word fix that saves someone twenty confused minutes.
+
+      [!] A DEAD CONSTANT   (line 6)
+
+          YOUTUBE_TOKEN_ENDPOINT is declared in the client file and never used -
+          correctly, since the client must never call Google's token endpoint
+          directly. The server routes have their own copy. Delete it before it
+          tempts someone.
+
+      [!] THE CALLBACK CAN HANG FOREVER   (callback/page.tsx:27-56)
+
+          The effect handles ?error= and ?code= and has no else branch. Land on
+          /auth/callback with neither - a stale bookmark, a refresh after the
+          code was consumed - and the spinner spins indefinitely with no message
+          and no way out. Section 9 covers this alongside the other UI dead ends.
+
+
+================================================================================
+                     Section 8 - upload
+                       the resumable protocol
+================================================================================
+   file: lib/youtube-upload.ts   (285 lines, class YouTubeUploader)
+
+   WHAT "RESUMABLE" MEANS
+
+      An ordinary upload is one request carrying the whole file. If it fails at
+      99%, everything is gone and you start again.
+
+      A resumable upload splits the transfer into a session plus many small
+      requests. You first ask the server to open an upload session and it gives
+      you a URL. Then you send the file in pieces to that URL, telling it which
+      byte range each piece covers. The server tracks how much it has received. If
+      a piece fails, you re-send that piece - not the file.
+
+      THE ANALOGY
+
+         Ordinary upload:  post a 2 GB parcel in one go. If the van crashes, the
+                           parcel is gone and you re-pack it from scratch.
+
+         Resumable:        rent a numbered locker (the session URL), then post
+                           400 small parcels, each labelled "bytes 5,242,880 to
+                           10,485,759 of 2,000,000,000". If parcel 273 is lost,
+                           you re-post parcel 273. The other 399 are already in
+                           the locker. You can even ring up and ask "how much have
+                           you got?" and carry on from there.
+
+      WHAT THAT BUYS
+
+         Failure is cheap        one 5 MB retry instead of a 2 GB restart
+         Real progress           bytes confirmed by the server, not guessed
+         Flat memory             only 5 MB is read into RAM at any moment
+         Resumability            the session URL is enough to continue later
+
+      That third point is the one that connects to the rest of the architecture.
+      Section 6 stores gigabytes on disk; if the upload read the whole file into
+      RAM to send it, all of that care would be undone at the last step. Chunked
+      upload keeps the memory profile flat from capture all the way to YouTube.
+
+   THE THREE UPLOAD MODES YOUTUBE OFFERS
+
+      Mode         When it fits                            Why not here
+      ----         -----------                             ------------
+      Simple       under 5 MB, metadata separate           far too small
+      Multipart    one request, metadata + file together   a single failure
+                   under ~64 MB                            loses everything, and
+                                                           the size cap is low
+      Resumable    anything large, or any unreliable       this is the one
+                   network
+
+      Google's own documentation recommends resumable for anything over about
+      5 MB. A screen recording is never under that.
+
+   THE ENDPOINT, DECODED
+
+      POST https://www.googleapis.com/upload/youtube/v3/videos
+           ?uploadType=resumable
+           &part=snippet,status
+
+      /upload/ prefix        the media endpoint, not the metadata-only one
+      uploadType=resumable   choose the protocol above
+      part=snippet,status    which parts of the resource are being sent
+
+         snippet  title, description, tags, categoryId
+         status   privacyStatus, and whether it is made for kids
+
+      part is a Google API convention. You declare which fields you are sending
+      or want back, which keeps payloads small. Omit `status` and privacyStatus
+      would be ignored - so a video meant to be private could publish publicly.
+      That is a real consequence, not a formality.
+
+   THE THREE STEPS
+
+      STEP 1 - OPEN THE SESSION   (initiateUpload, lines 77-112)
+
+         POST the endpoint with the METADATA ONLY as a JSON body - no video
+         bytes - plus three headers that matter:
+
+            Authorization: Bearer <token>
+            X-Upload-Content-Length: <total bytes>
+            X-Upload-Content-Type: video/*
+
+         The X- headers tell YouTube up front how big the upload will be, so it
+         can reject an over-quota or oversized upload before a single byte of
+         video is sent. Failing early is the point.
+
+         The response carries no useful body. What matters is the Location
+         header: that is the SESSION URL, and every subsequent request goes to it.
+         Lines 106-109 correctly treat a missing Location as fatal.
+
+         Note line 82: categoryId falls back to '22', which is "People & Blogs".
+         Every YouTube video needs a category, and 22 is the safe generic choice.
+         privacyStatus has no fallback here - it is sent verbatim from the caller
+         (line 87). The default a user actually gets is 'unlisted', set in React
+         state at page.tsx:43, so nothing publishes publicly by accident.
+
+      STEP 2 - SEND THE BYTES   (uploadChunks, lines 117-141)
+
+         A while loop over the blob in 5 MB slices:
+
+            let start = 0;
+            while (start < total) {
+              const end   = Math.min(start + chunkSize, total);
+              const chunk = blob.slice(start, end);
+              await this.uploadChunk(url, chunk, start, end - 1, total);
+              start = end;
+            }
+
+         blob.slice() is the reason this is memory-safe. Like the Blob
+         constructor in Section 6, it does not copy - it returns a view over a
+         byte range. The bytes are only read when fetch sends them, and only that
+         slice is ever resident.
+
+         THE OFF-BY-ONE THAT BITES EVERYONE
+
+            Content-Range: bytes 0-5242879/2000000000
+
+            The end byte is INCLUSIVE. A 5 MB chunk starting at 0 ends at
+            5,242,879, not 5,242,880. Hence `chunkEnd - 1` at line 130. Get this
+            wrong and every chunk overlaps by a byte, which corrupts the file.
+
+            The `/total` on the end is the full file size, which is how YouTube
+            knows when it is finished.
+
+         WHY 5 MB
+
+            YouTube requires resumable chunks to be a multiple of 256 KB, and 5 MB
+            is a clean multiple that Google's own examples use.
+
+            The trade-off is a straight line: bigger chunks mean fewer round trips
+            and more to re-send on failure; smaller chunks mean cheap retries and
+            more overhead. At 5 MB a one-hour recording is about 1.2 GB, so
+            roughly 242 requests. That is a sensible middle.
+
+      STEP 3 - READ THE STATUS   (uploadChunk, lines 146-194)
+
+         The protocol is a small state machine driven entirely by the status code:
+
+            308  Resume Incomplete   the normal case. Chunk accepted, send the
+                                     next one. 308 here means "not done yet",
+                                     which is unusual - most APIs would use 200
+            200  or 201              the FINAL chunk was accepted. The body is now
+                                     the video resource, and it contains the id
+            5xx                      transient. Back off and retry the same chunk
+            4xx                      permanent. Bad token, quota exceeded, invalid
+                                     metadata. Retrying cannot help
+
+         Getting 308-means-continue right is the core of the protocol. Treating it
+         as an error stalls at chunk one; treating 200 as "continue" loses the
+         video id.
+
+   THE RETRY DESIGN, AND THE BUG IN IT
+
+      The intent is exponential backoff: on a 5xx, wait 1s, then 2s, then 4s, up
+      to three attempts. That is the correct pattern - immediate retries during an
+      outage just add load.
+
+      [!!] THE 4xx GUARD IS INSIDE THE try, SO IT IS DEFEATED   (lines 186-187)
+
+           The structure is, in outline:
+
+              for (attempt = 0; attempt < maxRetries; attempt++) {
+                try {
+                  const res = await fetch(...);
+                  if (res.status === 308)  return { complete: false };
+                  if (res.ok)              return { complete: true, ... };
+                  if (res.status >= 500)   throw new Error('server error');
+
+                  throw new Error(`Upload failed: ${res.status}`);   // 4xx
+                } catch (err) {                       // <- catches BOTH throws
+                  if (attempt === maxRetries - 1) throw err;
+                  await sleep(backoff);
+                }
+              }
+
+           The final `throw` is meant to abort permanently on a 4xx. But it sits
+           inside the try block, so its own catch swallows it and retries anyway.
+
+           The consequence: an expired token or an exceeded quota - a 401 or a
+           403, neither of which can ever succeed on retry - is retried three
+           times with 1s and 2s waits. The user waits three seconds longer for
+           the same failure, per chunk, and the request count against a
+           quota-exceeded project triples.
+
+           The fix is one line moved: put the 4xx throw after the catch block, or
+           re-throw immediately when the error is marked non-retryable. Distinct
+           error types are the tidier version.
+
+   OTHER ROUGH EDGES
+
+      [!] resumeUpload() IS CORRECT AND NEVER CALLED   (lines 209-237)
+
+          It implements the protocol's query properly: a PUT with
+          `Content-Range: bytes */total` and an empty body asks the server "how
+          much do you have?", and the Range header in the 308 response answers.
+          Textbook.
+
+          And nothing imports it. So the app implements a resumable protocol and
+          then never resumes. If the network drops mid-upload the user starts
+          again from byte zero - which is precisely the failure resumable uploads
+          exist to prevent.
+
+          What is missing is only persistence: store the session URL and the byte
+          offset in localStorage as chunks succeed, and offer "resume upload" on
+          the next load. The hard part is already written.
+
+      [!] PROGRESS REPORTS ZERO ON FAILURE   (lines 63-69)
+
+          The catch in upload() emits bytesUploaded: 0. So a failure at 95% shows
+          the user "0 bytes uploaded", which is both wrong and demoralising - and
+          it destroys the one number a resume would need. It should report the
+          last confirmed offset.
+
+      [!] Content-Length IS SET AND SILENTLY IGNORED   (line 162)
+
+          Content-Length is a FORBIDDEN HEADER NAME in the Fetch spec. The
+          browser computes it from the body and drops any attempt to set it - no
+          error, no warning. So the line reads as though it is doing something
+          load-bearing and does nothing. Delete it.
+
+      [!] THE CHUNK PUTs CARRY NO Authorization HEADER
+
+          Only the initiating POST is authorised. This is actually per spec - the
+          session URL contains its own upload token, so the PUTs do not need one -
+          but it looks like a bug and is worth being able to explain rather than
+          discover live.
+
+      [!] THE 308 HANDLER ASSUMES THE WHOLE CHUNK LANDED   (lines 173-175)
+
+          The code moves the cursor forward by the full chunk size. The protocol
+          permits a partial accept and reports the true received range in the
+          Range header of the 308 response. In practice YouTube accepts whole
+          chunks, so this holds - but the header is right there and reading it
+          would be strictly correct.
+
+      [!] THERE IS NO WAY TO CANCEL   (no AbortController anywhere)
+
+          Once the loop starts it runs to completion or failure. A user who
+          started a 2 GB upload by mistake cannot stop it except by closing the
+          tab, and the in-flight fetch keeps going until it does. One
+          AbortController threaded through every fetch would fix it.
+
+      [!] 'processing' IS DECLARED AND NEVER EMITTED
+
+          The status union at line 21 includes 'processing', and no code path ever
+          sets it. UploadProgress.tsx renders three branches for it, so there is
+          dead UI in two files driven by a state that cannot occur.
+
+          It matters more than a spare enum value, because the state is REAL:
+          YouTube accepts the bytes and then transcodes for minutes before the
+          video is watchable. The app says "complete" and links straight to a URL
+          that may show "this video is unavailable". Polling videos.list for
+          processingDetails would close the gap - and the type already anticipates
+          it.
+
+      [!] setChunkSize() IS NEVER CALLED   (lines 258-260)
+
+          A configuration hook with no configurer. The interesting version would
+          be adaptive: measure throughput and grow or shrink the chunk. As written
+          it is dead weight.
+
+   THE QUOTA CEILING - THE MOST IMPORTANT NUMBER IN THE PROJECT
+
+      The YouTube Data API gives a project 10,000 quota units per day.
+      videos.insert costs 1,600 units.
+
+         10,000 / 1,600  =  6 uploads per day, per project
+
+      Not per user. PER PROJECT. Every user of a deployed instance draws from the
+      same 10,000.
+
+      So this app cannot serve a seventh upload in a day regardless of how good
+      the code is. No amount of optimisation moves it; the only remedies are
+      applying to Google for a quota increase, or having each user supply their
+      own OAuth client.
+
+      This is the real scaling limit, and naming it unprompted is a strong signal.
+      It shows you looked past the code at the platform it runs on. Section 13
+      develops it.
+
+   SMALL THINGS DONE RIGHT
+
+      generateDefaultTitle() (lines 266-278) produces "Screen Recording -
+      Aug 15, 2026 at 02:30 PM" using toLocaleDateString and toLocaleTimeString
+      with an explicit 'en-US' locale, a short month, and 12-hour time.
+
+      getVideoId() (lines 199-204) does not parse anything: the id is read from
+      the 200/201 response body inside uploadChunk (line 170) and stored on the
+      instance. getVideoId() returns that stored id, or throws if it is missing.
+
+      getYouTubeUrl() (lines 283-285) is a static helper, so the caller does not
+      have to know how to build a watch URL.
+
+
+================================================================================
+                     Section 9 - the React layer
+                     state machine and components
+================================================================================
+   files: app/layout.tsx                 (24 lines, the only Server Component)
+          app/page.tsx                   (288 lines, the orchestrator)
+          components/RecordingControls.tsx (235 lines)
+          components/UploadProgress.tsx  (133 lines)
+          components/WebcamPreview.tsx   (81 lines)
+          components/Toaster.tsx         (74 lines)
+          app/auth/callback/page.tsx     (82 lines)
+
+   THE SERVER/CLIENT SPLIT
+
+      Almost every file here starts with 'use client'. Only layout.tsx does not,
+      which makes it the single Server Component in the app.
+
+      That is not laziness, it is forced. Server Components cannot use hooks,
+      cannot attach event handlers, and have no access to browser APIs. This
+      entire app IS browser APIs - MediaRecorder, IndexedDB, canvas, localStorage.
+      There is nothing to render on a server.
+
+      What layout.tsx still does: loads Inter through next/font, which self-hosts
+      the font at build time so there is no runtime request to Google Fonts and no
+      layout shift; declares metadata for the document head; and wraps children in
+      ToastProvider so the whole tree can raise notifications.
+
+      Two related Next.js facts worth having ready:
+
+         'use client' marks a BOUNDARY, not a file. Everything imported below a
+         client component is also client code.
+
+         Client Components still server-render for the initial HTML. 'use client'
+         means "this also hydrates and runs in the browser", not "this skips SSR".
+
+   SUSPENSE AND useSearchParams - WHY THE BUILD FAILS WITHOUT IT
+
+      Both page.tsx and auth/callback/page.tsx wrap their real content in
+      <Suspense>. That is not a loading nicety; without it the production build
+      fails.
+
+      The reason: useSearchParams() reads the query string, which is not known
+      during static prerendering - the same HTML would be served for ?code=abc and
+      ?code=xyz. So Next.js has to opt that subtree out of prerendering, and a
+      Suspense boundary is how you tell it where the dynamic part starts. It
+      renders the fallback into the static HTML and fills in the real content on
+      the client, where the URL exists.
+
+      Without a boundary, `next build` errors with "useSearchParams() should be
+      wrapped in a suspense boundary". It builds fine in dev and fails in CI,
+      which is why this catches people out.
+
+      So both files use the same shape: an outer component that is only a
+      <Suspense> wrapper with a spinner fallback, and an inner *Content component
+      that does the actual work.
+
+   THE STATE - AND THE HONEST CRITIQUE OF IT
+
+      HomeContent holds TEN useState hooks (page.tsx:35-44) and RecordingControls
+      holds another ten (lines 14-24).
+
+      In page.tsx they are: videoBlob, downloadUrl, isAuthd, uploading,
+      uploadProgress, youtubeUrl, videoTitle, videoDescription, privacyStatus,
+      uploadError.
+
+      The problem is that several of them are not independent. `uploading`,
+      `uploadProgress`, `youtubeUrl` and `uploadError` describe ONE thing -
+      where the upload is - in four separate booleans and objects. That permits
+      combinations that should be impossible: uploading true with an error set,
+      or a youtubeUrl present while still uploading. Nothing in the type system
+      objects.
+
+      The fix, and the answer to give if asked how you would refactor:
+
+         type UploadState =
+           | { phase: 'idle' }
+           | { phase: 'uploading'; progress: UploadProgress }
+           | { phase: 'done'; videoId: string }
+           | { phase: 'error'; message: string };
+
+      A discriminated union makes the illegal combinations unrepresentable, and
+      one useReducer replaces four setState calls that must be kept consistent by
+      hand. Being able to name the smell and the remedy is worth more than having
+      avoided it.
+
+   THE DATA FLOW
+
+      RecordingControls owns the recording; page.tsx owns everything after it.
+      They communicate by callback:
+
+         RecordingControls  --onRecordingComplete(blob)-->  page.tsx
+                                                               |
+                                                               v
+                                                 createObjectURL -> preview
+                                                               |
+                                                          user edits title
+                                                               |
+                                                               v
+                                                       YouTubeUploader
+
+      handleRecordingComplete (lines 57-64) stores the blob, creates an object URL
+      for the <video> preview, and generates a default title.
+
+      URL.createObjectURL gives you a `blob:` URL that points at in-memory or
+      on-disk data without ever base64-encoding it, so a 2 GB recording can be
+      previewed instantly. It holds a reference until explicitly released, which
+      is why handleNewRecording (line 67) calls revokeObjectURL. Forgetting that
+      leaks the whole recording for the life of the page.
+
+   THE TOAST SYSTEM   (components/Toaster.tsx, 74 lines)
+
+      A small, complete piece of React: a Context holding the toast array, a
+      provider that renders them fixed to the viewport, and a useToast() hook so
+      any component can call toast('Saved', 'success') without prop drilling.
+
+      Details worth noticing:
+
+         The default context value (line 17) is a no-op function rather than
+         undefined, so calling useToast outside the provider does nothing instead
+         of throwing.
+
+         Ids come from a module-level `let _id = 0` (line 23) rather than
+         Math.random, so they are guaranteed unique and stable.
+
+         `toast` is a useCallback with an empty dependency array, so its identity
+         never changes and consumers putting it in a dependency array do not
+         re-run.
+
+         The container is pointer-events-none and each toast is
+         pointer-events-auto, so the overlay never blocks clicks on the page
+         underneath but the toasts themselves stay interactive.
+
+         aria-live="polite" (line 41) means a screen reader announces new toasts
+         without interrupting whatever it is currently reading. That is the
+         correct politeness level for status messages.
+
+      [!] The dismissal timer (lines 31-33) is a setTimeout that is never
+          cleared. Unmount the provider with toasts pending and the callback still
+          fires, calling setState on an unmounted component. React 19 no longer
+          warns about it, but it is still a leak, and there is no manual dismiss
+          button - a toast cannot be closed early.
+
+   ACCESSIBILITY, HONESTLY
+
+      What is right: aria-live on the toast region, semantic <button> elements
+      throughout, and disabled states that are genuinely disabled rather than
+      just styled grey.
+
+      What is missing:
+
+         WebcamPreview's four corner buttons (lines 34-43) have a `title` and no
+         text and no aria-label. A screen reader announces "button" four times
+         with nothing to distinguish them. `title` is not a reliable accessible
+         name and is invisible on touch. One aria-label each fixes it.
+
+         The size slider has no aria-label either - it has a visible <p> label
+         that is not programmatically associated with the input.
+
+         No focus trap or focus management, no keyboard shortcut for
+         start/stop recording, and progress bars are divs with a width percentage
+         rather than role="progressbar" with aria-valuenow.
+
+      None of this is hard to fix, and being able to list it accurately is better
+      than claiming the app is accessible.
+
+   THE CONDITIONAL-RENDER DEAD END - THE WORST UX BUG
+
+      page.tsx renders in three mutually exclusive blocks:
+
+         line 169   {!videoBlob && <RecordingControls />}
+         line 176   {uploadProgress && <UploadProgress />}
+         line 183   {videoBlob && downloadUrl && !uploading && !uploadProgress
+                     && <the preview card>}
+
+      Now follow a successful upload:
+
+         videoBlob        set
+         downloadUrl      set
+         uploadProgress   set, with status 'complete'
+
+      Block 169 is false because videoBlob is set. Block 183 is false because
+      uploadProgress is set. Block 176 is the only thing on screen: a completed
+      progress bar.
+
+      And the "↩ New Recording" button is at line 192 - INSIDE the card that
+      block 183 just hid.
+
+      So after a successful upload the user is stuck. There is no button to record
+      again, no way back to the recorder, and the only escape is reloading the
+      page. The success path is the broken one, which is the worst kind of dead
+      end because every user hits it and only after everything worked.
+
+      The same shape breaks two more things. The uploadError block at lines
+      244-249 is inside the card gated on !uploading && !uploadProgress, but any
+      upload error also sets uploadProgress - so the error message is unreachable
+      too, and a failed upload shows a stalled bar with no explanation. And
+      RecordingControls.tsx:136 early-returns a different UI while recording,
+      which is what makes the webcam controls unreachable mid-recording in
+      Section 5.
+
+      The root cause is the same in every case: boolean gates that were each
+      correct in isolation, combined into states nobody enumerated. This is
+      exactly what the discriminated union above prevents - with a single `phase`,
+      'done' renders the done screen and there is no combination to get wrong.
+
+      The tactical fix is small: move "New Recording" outside the gated card, or
+      render it inside the UploadProgress complete branch.
+
+   OTHER ROUGH EDGES
+
+      [!] THE OAUTH CALLBACK CAN SPIN FOREVER   (callback/page.tsx:27-56)
+
+          Branches for ?error= and ?code=, and no else. Arrive with neither and
+          the spinner never resolves. One else branch with a message and a link
+          home.
+
+      [!] NO DOUBLE-CLICK GUARD ON RECORD   (RecordingControls.tsx:69-107)
+
+          startRecording is async and nothing disables the button while it runs.
+          Two fast clicks start two ScreenRecorder instances, each requesting its
+          own screen and microphone, both writing chunks into the same IndexedDB
+          recording. The result is interleaved chunks - a corrupt video.
+
+      [!] THE STATUS POLL IS EXPENSIVE   (lines 44-52)
+
+          A two-second setInterval calling getTotalSize(), which reads every
+          chunk record. Section 6 has the full cost. The label it drives is
+          cosmetic.
+
+      [!] AUTH STATE IS READ ONCE ON MOUNT   (page.tsx:47-55)
+
+          A single effect reads isAuthenticated at mount. If the token expires
+          while the page is open, the UI keeps offering upload until the attempt
+          fails. window.history.replaceState at line 52 is correct, though - it
+          strips ?auth=success from the URL so a reload does not re-trigger.
+
+      [!] THE DOWNLOAD FILENAME COMES FROM USER TEXT   (page.tsx:255)
+
+          download={`${videoTitle}.webm`}, where videoTitle is a free-text input.
+          Slashes and colons produce a filename the OS will mangle or reject.
+          Sanitising it is one line. Not a security problem - the download
+          attribute cannot escape the download directory - but a real annoyance.
+
+      [!] THE PREVIEW IS A WebM FILE
+
+          The Download button hands over .webm, which some desktop players and
+          some Safari versions will not open. Naming this as a known trade-off of
+          the codec choice in Section 4 is better than being surprised by it.
+
+
+================================================================================
+                     Section 10 - testing
+                what is covered, what is not, and why
+================================================================================
+   files: vitest.config.ts, tests/setup.ts, tests/ (6 files, 42 tests)
+
+   THE STACK, AND WHY EACH PIECE IS THERE
+
+      Vitest 4                the test runner. Chosen over Jest because it shares
+                              Vite's transform pipeline, so TypeScript and JSX
+                              need no separate Babel configuration, and it starts
+                              in well under a second
+      jsdom 29                a JavaScript implementation of the DOM, so
+                              document and window exist in Node
+      @testing-library/react  render components and query them the way a user
+                              would - by role and by text, not by class name
+      fake-indexeddb 6        a real, spec-compliant IndexedDB in memory
+
+      The fake-indexeddb choice is the one worth explaining. It is not a stub that
+      returns canned values: it implements the actual specification, including
+      transactions, indexes, cursors and key ordering. So tests exercise the real
+      lib/indexdb.ts logic - the transaction wrapping, the index queries, the
+      sort - rather than a mock's idea of it.
+
+      vitest.config.ts is four decisions: environment 'jsdom',
+      setupFiles ['./tests/setup.ts'], globals true, and a resolve.alias mapping
+      '@' to the project root so tests import exactly the same paths the app does.
+
+      globals: true means describe, it and expect are available without importing
+      them. Convenient, and it hides a mistake - see the rough edges below.
+
+   WHAT tests/setup.ts DOES, AND THE DIFFERENCE BETWEEN THE TWO MOCKS
+
+      localStorage    jsdom does provide one, but a hand-rolled Map-backed mock
+                      is easier to reset between tests. A CONVENIENCE.
+      navigator.clipboard  jsdom does NOT implement it at all, and the copy-link
+                      button calls it. Without this mock the test throws. A
+                      NECESSITY.
+
+      Knowing which is which is a good small signal: one mock exists for
+      ergonomics, the other because the environment genuinely lacks the API.
+
+   THE COVERAGE MAP
+
+      File                          Tests   What is verified
+      ----                          -----   ----------------
+      tests/lib/youtube-auth.test.ts   10   token storage and retrieval, expiry
+                                            maths including the 5-minute buffer,
+                                            clearing, isAuthenticated
+      tests/lib/indexdb.test.ts         9   init, storeChunk ids, per-recordingId
+                                            isolation, combineChunks MIME type,
+                                            scoped versus global clear, size on
+                                            empty
+      tests/lib/youtube-upload.test.ts  7   session initiation, the Location
+                                            header, metadata defaults, error
+                                            paths, the URL helper
+      tests/components/UploadProgress   6   percentage rendering, byte
+                                            formatting, each status branch
+      tests/components/Toaster          5   provider renders, toast appears,
+                                            auto-dismiss, multiple toasts
+      tests/components/WebcamPreview    5   corner selection, size slider,
+                                            callbacks fire
+                                        --
+                                        42
+
+      The shape of that table is the point. Testing effort went to PURE LOGIC and
+      PRESENTATIONAL COMPONENTS - the two things that are cheap to test and where
+      a regression is silent.
+
+   WHAT IS DELIBERATELY NOT TESTED, AND WHY THAT IS DEFENSIBLE
+
+      recorder.ts and compositor.ts have no tests at all. That is the right call,
+      and being able to say why matters more than the coverage number:
+
+         MediaRecorder does not exist in jsdom. Neither does getDisplayMedia,
+         getUserMedia, AudioContext, or canvas.captureStream. Mocking all of them
+         means writing a fake browser, and then the test verifies that the fake
+         behaves as imagined - not that the code works.
+
+         The interesting failures in those files are TIMING and REAL-DEVICE
+         behaviour: does a track actually end when the user clicks the browser's
+         stop bar, does requestAnimationFrame stall in a hidden tab, does the
+         audio graph really mix. None of that reproduces in jsdom.
+
+      The honest position: unit tests are the wrong tool for the capture layer.
+      Playwright with `--use-fake-device-for-media-capture` drives a real Chromium
+      with a synthetic camera and microphone, and would test it properly. That is
+      the gap, and it is a tooling gap rather than a discipline one.
+
+   THE REAL GAPS IN WHAT IS TESTED
+
+      [!] THE MULTI-CHUNK LOOP NEVER RUNS TWICE
+
+          The uploader happy-path test uses new Blob(['hello video']) - eleven
+          bytes. The chunk size is 5 MB, so the while loop iterates exactly once.
+
+          Everything that makes the chunking interesting is therefore untested:
+          the Content-Range arithmetic across chunk boundaries, the inclusive end
+          byte, the 308-then-continue transition, and progress accumulation.
+
+          The fix is cheap. A blob of about 12 MB - a Uint8Array is enough, no
+          real video needed - forces three iterations and would have caught an
+          off-by-one immediately.
+
+      [!] THE RETRY PATH HAS NO TEST
+
+          Nothing simulates a 500 followed by a success, and nothing asserts that
+          a 4xx stops immediately. That is exactly why the retry bug in Section 8
+          survived: a test that mocked a 403 and asserted a single fetch call
+          would have failed loudly.
+
+          This is the best example in the project of a gap and a bug lining up. It
+          is worth saying out loud, because "the untested path is the one with the
+          bug" is the whole argument for testing error handling.
+
+      [!] TWO TESTS WEAKEN THEIR OWN ASSERTIONS
+
+          indexdb.test.ts:71-72 asserts combined.size > 0 instead of an exact
+          byte count, and lines 119-121 assert only typeof size === 'number'.
+          Both carry comments explaining that fake-indexeddb does not reliably
+          preserve exact Blob.size under jsdom.
+
+          The comments are honest, which is good practice, but the tests no longer
+          verify what they are named after. A getTotalSize test that only checks
+          the return type is a smoke test. The clean answer is to store
+          ArrayBuffers in the test and compare byteLength, or to move this
+          assertion to a real-browser test.
+
+      [!] NO TEST FOR THE ORCHESTRATOR
+
+          page.tsx is 288 lines of state coordination and has no test - which is
+          why the dead end in Section 9 is in the codebase. A render test that
+          drove the flow to 'complete' and asserted a visible "New Recording"
+          button would have caught it in seconds.
+
+      [!] A MISSING IMPORT THAT ONLY globals: true HIDES
+
+          Toaster.test.tsx:24 calls afterEach without importing it, while line 1
+          imports describe, it, expect and beforeEach explicitly. It works purely
+          because globals: true injects it. So the file half-imports and half-
+          relies on globals, which is inconsistent and would break the moment
+          globals were turned off. Line 44 also destructures `container` and never
+          uses it.
+
+   TOOLING GAPS OUTSIDE THE TEST FILES
+
+      [!] tsconfig.json EXCLUDES tests FROM TYPE CHECKING
+
+          "exclude": ["node_modules", "tests"]
+
+          So `tsc --noEmit` never looks at the test files, and type errors inside
+          them are invisible until Vitest runs. This was done to keep the Next.js
+          build from tripping over test-only types, which is a real problem - but
+          the correct solution is a second tsconfig.test.json that extends the
+          base and includes tests, so both are checked.
+
+      [!] npm run lint DOES NOT WORK
+
+          The script maps to `next lint`, which is deprecated in Next 15 and slated
+          for removal, and there is no ESLint configuration file in the repo at
+          all. Running it drops you into a setup wizard rather than linting
+          anything.
+
+          So there is no automated style or correctness gate. Several findings in
+          this document - the unused variable, the missing import, the unhandled
+          promise - are exactly what a configured ESLint with
+          @typescript-eslint/no-floating-promises would have flagged.
+
+          Related: noUnusedLocals is not enabled in tsconfig either, which is why
+          the dead constants and unused destructures survive.
+
+      [!] THERE IS NO CI
+
+          No .github directory exists. Nothing runs the 42 tests except a human
+          remembering to. A six-line GitHub Actions workflow doing install,
+          tsc --noEmit and vitest run would be the highest-value addition to the
+          repository, because it is what makes every other test worth writing.
+
+
+================================================================================
+                     Section 11 - the bug ledger
+                        everything ranked
+================================================================================
+   This section adds no new explanation. Every entry is explained in full in the
+   section named in the last column. This is the index - what is wrong, where,
+   what it costs, and what it costs to fix.
+
+   TIER 1 - BREAKS THE PRODUCT
+
+      #   What                          Where                        Impact                                Fix    See
+      -   ----                          -----                        ------                                ---    ---
+      1   rAF stalls in a hidden tab    compositor.ts:81-113         with the webcam on, video freezes     large  S5
+                                                                    the moment the user switches tabs -
+                                                                    which is what a screen recorder is for
+      2   post-upload UI dead end       page.tsx:169 / 176 / 183     after a SUCCESSFUL upload nothing     tiny   S9
+                                        button at 192                is reachable. Reload is the only
+                                                                    way out
+      3   no state parameter            youtube-auth.ts:34-41        CSRF / session fixation. A victim's   small  S7
+                                                                    recordings can land on an attacker's
+                                                                    channel
+      4   4xx retried three times       youtube-upload.ts:186-187    permanent failures retried with       tiny   S8
+                                                                    backoff. Triples requests against a
+                                                                    quota-exceeded project
+      5   clearAllRecordings on mount   indexdb.ts:170               a second tab wipes the first tab's    small  S6
+                                        RecordingControls.tsx:27     recording mid-flight, and crash
+                                                                    recovery is impossible
+
+   TIER 2 - BREAKS UNDER REAL USE
+
+      #   What                          Where                        Impact                                Fix    See
+      -   ----                          -----                        ------                                ---    ---
+      6   AudioContext never closed     recorder.ts:103              ~6 record/stop cycles and recording   tiny   S4
+                                                                    stops working until reload
+      7   chunk write errors swallowed  recorder.ts:137-139          a failed IndexedDB write is silent.   small  S4
+                                                                    Missing chunks, discovered at the end
+      8   resumeUpload never called     youtube-upload.ts:209        a dropped connection restarts a 2 GB  medium S8
+                                                                    upload from zero, despite the
+                                                                    protocol being implemented
+      9   getTotalSize polled every 2s  indexdb.ts:185               O(n) read every 2 seconds, so O(n^2)  tiny   S6
+                                        RecordingControls.tsx:44     over a recording, for one label
+      10  no double-click guard         RecordingControls.tsx:69     two recorders write interleaved       tiny   S9
+                                                                    chunks into one recording - corrupt
+                                                                    video
+      11  upload error unreachable      page.tsx:244-249             a failed upload shows a stalled bar   tiny   S9
+                                                                    with no message
+      12  progress reports 0 on failure youtube-upload.ts:63-69      "0 bytes" after failing at 95%, and   tiny   S8
+                                                                    it destroys the offset a resume needs
+      13  no upload cancellation        youtube-upload.ts (none)     a 2 GB upload started by mistake      small  S8
+                                                                    cannot be stopped
+      14  'processing' never emitted    youtube-upload.ts:21         says "complete" and links to a video  medium S8
+                                                                    YouTube is still transcoding
+      15  transaction errors unhandled  indexdb.ts (all methods)     an aborted transaction leaves a       small  S6
+                                                                    promise pending forever - a silent
+                                                                    hang
+      16  refresh failure clears all    youtube-auth.ts:171-175      a network blip signs the user out     tiny   S7
+                                                                    and forces re-consent
+
+   TIER 3 - WRONG BUT SURVIVABLE
+
+      #   What                          Where                        Impact                                Fix    See
+      -   ----                          -----                        ------                                ---    ---
+      17  16:9 webcam assumption        compositor.ts:66             a 4:3 camera is stretched             tiny   S5
+      18  canvas size frozen at start   compositor.ts:48-49          resizing the shared window distorts   small  S5
+                                                                    the rest of the recording
+      19  callback page can hang        callback/page.tsx:27-56      no else branch - a spinner forever    tiny   S7/S9
+      20  live webcam adjust is dead    compositor.ts:130-139        four methods that look like a         small  S5
+                                        recorder.ts, controls:197    feature and do nothing
+      21  no missing-header check       next.config.ts               no CSP, HSTS, X-Frame-Options or      small  S12
+                                                                    Referrer-Policy
+      22  routes unauthenticated and    api/auth/exchange, refresh   anyone can drive them, unbounded      medium S12
+          unthrottled
+      23  Google errors forwarded       exchange:53, refresh:51      upstream error text leaked to the     tiny   S12
+                                                                    client
+      24  MediaRecorder error message   recorder.ts:152              every failure reports "[object        tiny   S4
+                                                                    Event]"
+      25  IndexedDB errors lose cause   indexdb.ts (all methods)     quota-exceeded and permission-denied  tiny   S6
+                                                                    are indistinguishable
+      26  empty Blob on zero chunks     indexdb.ts:120-124           a zero-byte recording flows onward    tiny   S6
+                                                                    as if valid
+      27  storage not marked persistent indexdb.ts (none)            the browser may evict a multi-GB      tiny   S6
+                                                                    recording under disk pressure
+      28  auth read once on mount       page.tsx:47-55               UI offers upload after the token      tiny   S9
+                                                                    expires
+      29  toast timer never cleared     Toaster.tsx:31-33            setState after unmount, no manual     tiny   S9
+                                                                    dismiss
+      30  aria-labels missing           WebcamPreview.tsx:34-43      four buttons announced as "button"    tiny   S9
+      31  download filename unsanitised page.tsx:255                 a title with a slash breaks the       tiny   S9
+                                                                    download
+      32  recordingId from Date.now()   indexdb.ts:21                two instances in one millisecond      tiny   S6
+                                                                    collide
+      33  slider max 40 vs clamp 50     WebcamPreview.tsx:68         two numbers for one limit             tiny   S5
+      34  1px border, not 2             compositor.ts:101-103        cosmetic - clipped stroke             tiny   S5
+      35  two frame-rate limiters       compositor.ts:81 / 116       uneven frame timing                   small  S5
+
+   TIER 4 - DEAD CODE AND TOOLING
+
+      #   What                          Where                        See
+      -   ----                          -----                        ---
+      36  pause() / resume() unreachable        recorder.ts:203-216          S4
+      37  this.chunks written, never read        recorder.ts:136              S4
+      38  getStorageEstimate() never called      indexdb.ts:193-203           S6
+      39  setChunkSize() never called            youtube-upload.ts:258        S8
+      40  YOUTUBE_TOKEN_ENDPOINT unused          youtube-auth.ts:6            S7
+      41  compositor copies audio pointlessly    compositor.ts:118-122        S5
+      42  error names .env.local, project uses .env   youtube-auth.ts:30      S7
+      43  tests excluded from tsc                tsconfig.json                S10
+      44  npm run lint is broken, no ESLint config    package.json            S10
+      45  no CI at all                           no .github directory         S10
+      46  multi-chunk and retry paths untested   tests/lib/youtube-upload     S10
+      47  tailwind content glob points at ./pages/**, which does not exist    S13
+      48  unused theme tokens: colors.surface, colors.border, spin-slow       S13
+
+   THE ONE-DAY ORDER
+
+      If given a single day, this is the sequence and the reasoning:
+
+         Morning, first hour   #2 and #11. Two tiny render fixes that turn a
+                               dead-end app into a usable one. Highest value per
+                               line changed in the whole list
+         Second hour           #6 store and close the AudioContext, #4 move the
+                               throw out of the try. Two tiny fixes to failures
+                               that look catastrophic to a user
+         Third hour            #3 add the state parameter. The only security bug
+                               with a real attack behind it
+         Afternoon             #5 scope the clear by recordingId, #9 keep a
+                               running size total, #10 disable the button while
+                               starting
+         If time remains       #45 add CI, then #46 a 12 MB upload fixture
+
+      #1 is the most serious bug in the document and it is deliberately NOT in the
+      one-day plan: moving compositing into a worker with OffscreenCanvas is a
+      day's work by itself. Saying that explicitly - "the biggest bug is not the
+      first thing I would fix, because five smaller fixes deliver more in the same
+      day" - is a better answer than pretending it is quick.
+
+
+================================================================================
+                     Section 12 - security review
+                      threat model and blast radius
+================================================================================
+   Mechanisms are explained where they live: OAuth, the secret relay, NEXT_PUBLIC_
+   and localStorage are all Section 7. This section is the threat model - what is
+   worth protecting, what could go wrong, and how bad each one is.
+
+   WHAT IS WORTH PROTECTING, IN ORDER
+
+      Asset                     Why it matters                      Where it lives
+      -----                     --------------                      --------------
+      client_secret             lets anyone impersonate this app    server env only
+                                to Google
+      the user's refresh token  mints upload access indefinitely    localStorage
+                                until revoked
+      the user's access token   upload access for up to an hour     localStorage
+      the recording itself      may contain anything on screen -    IndexedDB, on
+                                credentials, private messages       the user's disk
+      the API quota             6 uploads a day, shared by every    Google project
+                                user of a deployment
+
+      The recording deserves more attention than it usually gets. A screen
+      recorder captures whatever is on the screen, including a password manager
+      being opened or a private conversation. It stays in IndexedDB on the user's
+      own machine - which is the right place for it - but Section 6's global
+      store.clear() is the only thing deleting it, and nothing marks it persistent,
+      so the lifetime is not deliberate.
+
+   WHAT THE ARCHITECTURE GETS RIGHT
+
+      Each of these is explained in Section 7; listed here so the review is
+      complete.
+
+         The client_secret never reaches the browser. Read only via
+         process.env.YOUTUBE_CLIENT_SECRET in the two route handlers.
+         The NEXT_PUBLIC_ boundary is respected exactly - public values prefixed,
+         the secret not.
+         .env is gitignored; the tracked example file has names and no values.
+         The scope is youtube.upload only - least privilege, so a stolen token
+         cannot read or delete anything.
+         The authorization code flow is used rather than the deprecated implicit
+         flow, so tokens never appear in a URL or in browser history.
+         Consent happens on accounts.google.com via a full navigation, so the user
+         can see the real origin in the address bar.
+         Video data never touches this app's servers. There is no central store to
+         breach.
+         The default privacyStatus is 'unlisted' (set in the UI at page.tsx:43),
+         so nothing publishes publicly by accident.
+
+   THE ATTACK SURFACE, WALKED THROUGH
+
+      There are exactly two server endpoints and they are the whole server-side
+      surface:
+
+         POST /api/auth/exchange    code    -> tokens
+         POST /api/auth/refresh     refresh -> access token
+
+      NEITHER CHECKS WHO IS CALLING, AND NEITHER IS RATE LIMITED.
+
+      Take that seriously, then bound it honestly:
+
+         What an attacker CANNOT do
+            They cannot extract the client_secret. It is only added server-side
+            and never returned.
+            They cannot mint tokens without a valid code or refresh token, both of
+            which are user-specific and which Google validates.
+            They cannot use /api/auth/refresh without already holding someone's
+            refresh token - and if they hold that, they do not need this endpoint.
+
+         What an attacker CAN do
+            Use the endpoints as a free, anonymous proxy to Google's token
+            endpoint, with this project's credentials attached.
+            Drive request volume against Google using this OAuth client's
+            identity, which risks rate limiting or suspension of the client
+            itself.
+            Probe error responses. Both routes forward Google's raw error body in
+            `details`, which can reveal configuration detail about the OAuth
+            client.
+
+      So: no direct compromise, but an unmetered path to spending this project's
+      reputation with Google. The realistic remedies are IP-based rate limiting on
+      both routes, an Origin or Referer check to reject requests that did not come
+      from the app's own pages, generic error responses with the real detail logged
+      server-side, and - because exchange runs before any session exists - PKCE, so
+      a code is only redeemable by the browser that started the flow.
+
+      Note the asymmetry worth mentioning: exchange CANNOT require caller
+      authentication, because it runs before the user has any session. refresh
+      could, if there were a session concept at all. That is a consequence of
+      having no backend, not an oversight in these files.
+
+   NO SECURITY HEADERS AT ALL
+
+      next.config.ts is five lines containing only { reactStrictMode: true }.
+      There is no headers() block, and there is no middleware.ts anywhere in the
+      repository. So the app ships with none of:
+
+         Content-Security-Policy    the one that matters most here. It is the
+                                    defence-in-depth layer against the XSS that
+                                    would read the tokens out of localStorage
+         Strict-Transport-Security  forces HTTPS on subsequent visits
+         X-Frame-Options            or CSP frame-ancestors. Without it the app can
+                                    be framed, which enables clickjacking of the
+                                    record and upload buttons
+         Referrer-Policy            controls what leaks in the Referer header
+         X-Content-Type-Options     stops MIME sniffing
+
+      CSP is the important one, and the reason is the localStorage trade-off in
+      Section 7: since an XSS is what turns that trade-off into a compromise, a
+      CSP that blocks injected script is what keeps the trade-off acceptable.
+      Choosing localStorage AND shipping no CSP is what makes the combination
+      weaker than either decision alone.
+
+      This is a ten-line fix in next.config.ts and it is the cheapest security
+      work available.
+
+   THINGS THAT LOOK LIKE BUGS AND ARE NOT
+
+      Being able to defend these is as valuable as finding real problems, because
+      an interviewer may point at them to see whether you fold.
+
+         The chunk PUTs carry no Authorization header.
+            Correct per spec. The resumable session URL contains its own upload
+            token; only the initiating POST needs the bearer token. Section 8.
+
+         The client_id is visible in the JavaScript bundle.
+            Correct and unavoidable. It is the app's public name, it appears in
+            the authorisation URL anyway, and OAuth is designed on the assumption
+            that it is public. Section 7.
+
+         The recording is never sent to our server.
+            Deliberate, and it is a security PROPERTY, not a gap. There is no
+            central video store to breach and no bandwidth bill.
+
+         No CSRF token on the API routes.
+            Both routes are POST-only, take a JSON body, and hold no session or
+            cookie - so there is no ambient authority for a forged request to
+            ride. Classical CSRF does not apply. The OAuth `state` parameter is
+            the CSRF defence that IS missing, and it belongs in the flow, not on
+            the routes.
+
+         Tokens in localStorage rather than cookies.
+            A trade-off with a stated reason, not an accident. Section 7 has the
+            full argument, including what would change with a backend.
+
+   PRIORITY ORDER FOR SECURITY WORK
+
+         1  add the OAuth state parameter                 the only bug with a
+                                                          concrete attack path
+         2  add security headers, CSP first               cheapest defence for the
+                                                          largest exposure
+         3  rate limit both auth routes                   stops anonymous use of
+                                                          the project's identity
+         4  stop forwarding Google's error bodies         one line each
+         5  add PKCE                                     required by OAuth 2.1,
+                                                          and it hardens exchange
+         6  scope the IndexedDB clear by recordingId      protects the user's own
+                                                          data from the app
+         7  httpOnly cookies for tokens                   only worth doing
+                                                          alongside a backend
+
+
+================================================================================
+                 Section 13 - scalability and trade-offs
+================================================================================
+
+   THE FIRST THING TO SAY
+
+      "Scaling" means something unusual here, and saying so immediately reframes
+      the whole conversation.
+
+      There is no server doing work. Recording, compositing, storage and upload all
+      happen in the user's browser, and the video never passes through any
+      infrastructure this project owns. So the usual questions - how many requests
+      per second, how do you shard the database, what does the load balancer do -
+      have no purchase. A thousand simultaneous users are a thousand independent
+      browsers doing their own work.
+
+      What DOES limit this app:
+
+         1. one browser tab's CPU and memory
+         2. IndexedDB's share of the user's disk
+         3. the user's upload bandwidth
+         4. the YouTube API quota - and this is the one that actually binds
+
+   THE FOUR AXES
+
+      AXIS 1 - RECORDING LENGTH
+
+         From Section 4: 2.5 Mbps video plus 128 kbps audio is about 330 KB per
+         second, so roughly 1.2 GB per hour, and about 1.6 MB per five-second
+         chunk.
+
+         Length     Size      Chunks    Upload PUTs   Verdict
+         ------     ----      ------    -----------   -------
+         5 min      ~100 MB      60          20       comfortable
+         30 min     ~590 MB     360         118       fine
+         1 hour     ~1.2 GB     720         242       works, but see below
+         3 hours    ~3.5 GB   2,160         708       browser storage territory
+
+         Memory is genuinely flat, because of the chunking in Section 3, so length
+         does not blow up RAM. What degrades with length instead:
+
+            getTotalSize() polls every two seconds and reads every chunk, so its
+            cost grows linearly and the total work grows quadratically. Section 6.
+            The upload has no resume, so a 1.2 GB transfer that drops at 90% starts
+            over. Section 8.
+            The browser may evict IndexedDB under disk pressure, because
+            navigator.storage.persist() is never requested.
+
+         The practical ceiling is around an hour or two - and it is set by those
+         three fixable issues rather than by the architecture.
+
+      AXIS 2 - CONCURRENT USERS
+
+         This is the easy axis, and the answer is that it barely matters. Each user
+         records in their own browser and uploads directly to Google. There is no
+         shared state, no queue and no storage cost.
+
+         The static site can be served from a CDN. The only shared component is the
+         two auth routes, which are stateless, run at the edge, and handle a couple
+         of tiny requests per user per session. They would need rate limiting long
+         before they needed scaling.
+
+         The one thing that does NOT scale with users is the quota, which is next.
+
+      AXIS 3 - THE QUOTA CEILING
+
+         From Section 8: 10,000 units per day, 1,600 per videos.insert, which is
+         six uploads per day PER PROJECT - not per user.
+
+         This is the real limit on the whole product. Ten users cannot each upload
+         once. The 500th user cannot upload at all, and neither can the seventh.
+
+         The options, in order of realism:
+
+            Request a quota increase   Google has an audit form. Realistic for a
+                                       genuine product, and the standard path
+            Bring-your-own client      each user supplies their own OAuth client
+                                       id and secret, so each has their own
+                                       10,000. Technically clean, terrible
+                                       onboarding
+            Multiple projects          rotate across several Google Cloud
+                                       projects. Against the terms of service.
+                                       Mention only to reject
+            Queue and drain            hold uploads and release six a day. Honest
+                                       but useless for a recording tool
+            A different destination    S3 or Cloudflare R2 has no such cap, but
+                                       then it is not a YouTube tool and it needs
+                                       storage and bandwidth
+
+         The right answer is the first one, with the second as a fallback for
+         self-hosters. What matters is naming the constraint before being asked.
+
+      AXIS 4 - CPU DURING RECORDING
+
+         Simultaneous work on the main thread with the webcam on: composite two
+         drawImage calls per frame at 15fps, encode VP9 at 2.5 Mbps, mix two audio
+         sources through the Web Audio graph, write about 1.6 MB to IndexedDB every
+         five seconds, and re-render React on a one-second timer plus a two-second
+         poll.
+
+         The encoder and the audio graph are native and off the main thread. The
+         compositor is not, and it is also the piece that freezes in a background
+         tab. That is why OffscreenCanvas in a worker fixes two problems at once,
+         and why it is the single highest-value change in the codebase.
+
+   THE TRADE-OFF LEDGER
+
+      Every entry is a decision that was made deliberately, with what it cost.
+
+      Decision                  Bought                          Cost
+      --------                  ------                          ----
+      No backend for video      no storage bill, no bandwidth   no server-side
+                                bill, nothing to breach,        processing, no
+                                total privacy                  sharing links, no
+                                                                cross-device access
+      IndexedDB, not memory     flat RAM, recordings limited    async complexity,
+                                by disk instead of heap         and 214 lines of
+                                                                promise wrapping
+      IndexedDB, not the File   works in every browser, no      no true streaming
+      System Access API         upfront file picker             writes; Chromium
+                                                                only would have
+                                                                been better
+      Canvas compositing        webcam PiP is possible at all   main-thread CPU,
+                                                                and it freezes in a
+                                                                hidden tab
+      WebM / VP9                what browsers actually support, some desktop players
+                                better quality per byte,        and Safari versions
+                                YouTube ingests it happily      will not play the
+                                                                downloaded file
+      Resumable upload          cheap retries, real progress,   ~242 requests per
+                                flat memory                     hour instead of one
+      localStorage for tokens   no backend, no session store,   any XSS reads the
+                                survives reload                 refresh token
+      prompt=consent always     the refresh token is never      returning users see
+                                lost                            the consent screen
+                                                                every time
+      Hand-rolled IndexedDB     no dependency, and it proves    boilerplate that
+      wrapper                   the raw API is understood       `idb` would remove
+      Hand-rolled resumable     full control, and it proves    the official client
+      upload                    the protocol is understood      handles retries and
+                                                                resume for you
+      Client-only React         one deployable, trivial        no SSR value, and 20
+                                hosting                         useState hooks in
+                                                                two files
+      Tailwind                  fast iteration, no naming,      long className
+                                dead CSS impossible             strings in the JSX
+      Vitest over Jest          no Babel config, sub-second     a smaller ecosystem
+                                startup                         than Jest's
+
+      THE ALTERNATIVES THAT WERE REJECTED, AND WHY
+
+         Instead of                   Why not
+         ----------                   -------
+         MediaRecorder -> a server    someone else pays for storage and bandwidth,
+                                      and the user's screen contents travel over
+                                      the network. The whole appeal is that they
+                                      do not
+         FFmpeg.wasm for compositing  a 25 MB WebAssembly download, and it cannot
+                                      composite live. It is a post-processing
+                                      tool, not a real-time one
+         WebRTC                       built for peer-to-peer streaming, not
+                                      recording to a file. Wrong tool
+         The official Google API      it is Node-oriented, drags in a large
+         client                       dependency, and the resumable protocol is
+                                      about eighty lines by hand. Hand-rolling it
+                                      is defensible here and demonstrates the
+                                      protocol is understood
+         Redux or Zustand             genuine overkill for one page. useReducer
+                                      with a discriminated union is the right
+                                      size, and is the refactor Section 9 argues
+                                      for
+         A CSS-in-JS library          runtime cost for no benefit over Tailwind
+         Electron or a native app     no install, no code signing, no per-platform
+                                      build. The browser can already do all of it
+
+   THE BOTTLENECKS, RANKED, WITH WHAT EACH IS WORTH
+
+      1  the quota ceiling            6 uploads/day/project. Blocks the product
+                                      entirely. Not a code fix - Google has to
+                                      raise it
+      2  compositing on the main      freezes in a hidden tab and competes with
+         thread                       the encoder. OffscreenCanvas in a worker
+                                      fixes both. About a day
+      3  no upload resume             one dropped connection wastes an entire
+                                      transfer. Persist the session URL and the
+                                      offset. Half a day
+      4  the O(n) size poll           quadratic work over a long recording for one
+                                      cosmetic label. Keep a running total. An hour
+      5  the AudioContext leak        recording breaks after ~6 cycles. Two lines
+      6  storage not persistent       a multi-GB recording can be evicted. One line
+      7  no adaptive bitrate          2.5 Mbps regardless of content. Text-heavy
+                                      1080p wants more; a static slide wants far
+                                      less
+
+      Notice that only #1 is architectural. Everything else is a known fix with a
+      known size, which is exactly the shape a healthy codebase's bottleneck list
+      should have.
+
+   WHAT WOULD CHANGE IF THIS HAD TO BE A PRODUCT
+
+      Ordered by what unblocks the most:
+
+         Get the quota raised, or ship bring-your-own-client for self-hosters.
+         Nothing else matters until uploads are not capped at six a day.
+         Move compositing to a worker. Fixes the background-tab freeze and the CPU
+         contention together.
+         Persist the upload session and call the resumeUpload that already exists.
+         Add CI, then close the two uploader test gaps in Section 10.
+         Add security headers and the OAuth state parameter. Section 12.
+         Model the upload as a discriminated union, which removes the dead end in
+         Section 9 by construction.
+         Poll videos.list for processing status, so "complete" means watchable.
+         Then, and only then, features: trimming, a share page, multiple
+         destinations.
+
+      The ordering is the answer. Reliability and the platform ceiling first,
+      correctness second, features last.
+
+
+================================================================================
+                     Section 14 - cheat sheet
+                     the one page to read last
+================================================================================
+
+   THE FILE MAP
+
+      lib/recorder.ts          309   capture, audio mixing, MediaRecorder
+      lib/compositor.ts        215   canvas webcam overlay
+      lib/indexdb.ts           214   chunk storage
+      lib/youtube-auth.ts      196   OAuth client side
+      lib/youtube-upload.ts    285   resumable upload
+      app/page.tsx             288   orchestration, all the UI state
+      components/RecordingControls.tsx  235
+      components/UploadProgress.tsx     133
+      components/WebcamPreview.tsx       81
+      components/Toaster.tsx             74
+      app/layout.tsx            24   the only Server Component
+      app/auth/callback/page.tsx 82
+      app/api/auth/exchange/route.ts 73   server: adds the client_secret
+      app/api/auth/refresh/route.ts  70   server: adds the client_secret
+                              ----
+                             2,279 lines of TypeScript, plus 42 tests in 6 files
+
+   EVERY NUMBER, IN ONE PLACE
+
+      5000 ms            MediaRecorder timeslice
+      2.5 Mbps           video bitrate
+      128 kbps           audio bitrate
+      ~330 KB/s          combined
+      ~19.7 MB/min       combined
+      ~1.2 GB/hour       combined
+      ~1.6 MB            one chunk
+      720                chunks in an hour
+      5 MB               upload chunk size, a multiple of 256 KB
+      ~242               upload PUTs in an hour
+      15 fps             compositing frame rate
+      20%                webcam width, as a fraction of the canvas
+      1920x1080          screen request, ideal
+      1280x720           webcam request, ideal
+      1 hour             access token lifetime
+      5 minutes          expiry safety buffer
+      10,000             daily quota units
+      1,600              units per videos.insert
+      6                  uploads per day, per project
+      3                  upload retry attempts, 1s / 2s / 4s backoff
+      ~6                 AudioContexts before Chrome refuses more
+
+   THE BROWSER APIs, ONE LINE EACH
+
+      getDisplayMedia       screen capture. Needs transient user activation, every
+                            time
+      getUserMedia          microphone and camera. Permission can be remembered
+      MediaRecorder         encodes a stream. start(ms) makes it chunked
+      Web Audio API         mixes two audio sources into one track
+      Canvas captureStream  turns a canvas into a video track
+      requestAnimationFrame drives the composite loop. Does NOT run when hidden
+      IndexedDB             async, on-disk, stores Blobs natively
+      Blob and slice        composite references. Neither copies bytes
+      createObjectURL       a blob: URL for preview. Must be revoked
+      localStorage          sync, ~5-10 MB, strings. Holds the tokens
+      fetch                 uploads. Content-Length is forbidden and ignored
+
+   THE SIX CONSTRAINTS THAT SHAPED EVERYTHING
+
+      1  MediaRecorder takes ONE video track and ONE audio track
+         -> the Web Audio mix, and the canvas compositor
+      2  requestAnimationFrame does not fire in a hidden tab
+         -> the worst bug in the codebase
+      3  A client_secret cannot live in a browser
+         -> the two server routes, and the NEXT_PUBLIC_ boundary
+      4  Content-Range end bytes are INCLUSIVE
+         -> chunkEnd - 1
+      5  useSearchParams cannot be statically prerendered
+         -> Suspense, or the build fails
+      6  10,000 quota units a day, 1,600 per upload
+         -> six uploads a day, and the real product ceiling
+
+================================================================================
